@@ -143,8 +143,9 @@ domainSeparator = keccak256(abi.encode(
 ))
 ```
 
-> **Note:** The `name` and `version` strings must be read from the deployed
-> contract's `eip712Domain()` function (EIP-5267) on each chain.
+> **Note:** In tests the domain uses `name="SwapVM"`, `version="1.0.0"`.
+> For production, read the actual values from the contract's
+> `eip712Domain()` function (EIP-5267) on each chain to be safe.
 
 ### 2.5 Signature
 
@@ -187,6 +188,12 @@ Rate = balanceOut / balanceIn
 
 ExactIn:  amountOut = floor(amountIn * balanceOut / balanceIn)
 ExactOut: amountIn  = ceil(amountOut * balanceIn / balanceOut)
+```
+
+`_limitSwapOnlyFull1D` (opcode 22) — only allows full fills:
+```
+ExactIn:  requires amountIn == balanceIn,  then amountOut = balanceOut
+ExactOut: requires amountOut == balanceOut, then amountIn  = balanceIn
 ```
 
 Rounding always favors the maker.
