@@ -82,6 +82,7 @@ const (
 	LevelActive    LevelStatus = iota // Waiting for trigger.
 	LevelTriggered                    // Executed on-chain.
 	LevelCancelled                    // Cancelled (by SL fire or user).
+	LevelSuspended                    // Permit expired, waiting for renewal.
 )
 
 // Priority determines gas strategy for execution.
@@ -117,6 +118,14 @@ type Position struct {
 	Levels        []Level
 	CreatedAt     int64 // Unix timestamp.
 	UpdatedAt     int64
+
+	// Permit2 authorization data (filled at position creation).
+	PermitSignature []byte         // EIP-712 signature (65 bytes: r || s || v).
+	PermitNonce     *big.Int       // Permit2 nonce used for this position.
+	PermitDeadline  int64          // Unix timestamp expiry of the permit.
+	PermitAmount    *big.Int       // Amount authorized (= TotalSize at creation).
+	PermitToken     common.Address // Token authorized (tokenIn for direction).
+	PermitActivated bool           // Whether the on-chain Permit2 allowance has been set.
 }
 
 // Pair returns the TokenPair for this position.
@@ -175,6 +184,16 @@ type OpenParams struct {
 	DecimalsBase  uint8  // Token decimals for base (e.g. 18 for WETH).
 	DecimalsQuote uint8  // Token decimals for quote (e.g. 6 for USDC).
 	Levels        []LevelParams
+
+	// Permit2 authorization (signed by user at position creation).
+	PermitSignature []byte   // EIP-712 signature (65 bytes).
+	PermitNonce     *big.Int // Permit2 nonce.
+	PermitDeadline  int64    // Unix timestamp expiry.
+
+	// Optional: signed approve TX for one-click flow.
+	// If present, keeper broadcasts this before activating permit.
+	// Frontend silently signs token.approve(Permit2, MAX) with user's local key.
+	SignedApproveTx []byte // RLP-encoded signed transaction, or nil.
 }
 
 // LevelParams defines a level at position creation time.
@@ -197,6 +216,17 @@ type MarketSwapParams struct {
 	DecimalsIn  uint8  // Token decimals for input token.
 	DecimalsOut uint8  // Token decimals for output token.
 	SlippageBps uint16 // Max slippage in bps (50 = 0.5%).
+
+	// Permit2 SignatureTransfer (signed by user for this market swap).
+	PermitSignature []byte   // EIP-712 signature (65 bytes).
+	PermitNonce     *big.Int // Permit2 nonce.
+	PermitDeadline  int64    // Unix timestamp (short, e.g. 5 minutes).
+
+	// Optional: signed approve TX for one-click flow.
+	SignedApproveTx []byte // RLP-encoded signed transaction, or nil.
+
+	// Native ETH: if true, user sends raw ETH and SwapExecutorV2 wraps to WETH.
+	NativeETH bool
 }
 
 // SwapResult is the outcome of a market swap.

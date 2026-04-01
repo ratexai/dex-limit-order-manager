@@ -47,6 +47,15 @@ func newExecutor(client ChainClient, keeperKey *ecdsa.PrivateKey, executorAddr c
 	}
 }
 
+// ExecutionMode determines how tokens are pulled from the user.
+type ExecutionMode uint8
+
+const (
+	ExecModeLegacy          ExecutionMode = iota // Direct ERC20 transferFrom.
+	ExecModePermit2Allowance                     // Permit2 AllowanceTransfer (multi-level positions).
+	ExecModePermit2Signature                     // Permit2 SignatureTransfer (single-use market swaps).
+)
+
 // executeSwapParams holds the parameters for a single swap execution.
 type executeSwapParams struct {
 	User        common.Address
@@ -57,26 +66,31 @@ type executeSwapParams struct {
 	MinAmountOut *big.Int
 	FeeBps      uint16
 	Priority    Priority
+	Mode        ExecutionMode
+
+	// Permit2 SignatureTransfer fields (Mode == ExecModePermit2Signature).
+	PermitNonce    *big.Int
+	PermitDeadline *big.Int
+	PermitSignature []byte
 }
 
-// executeSwap calls SwapExecutor.executeSwap on-chain, waits for the transaction
-// to be mined, and verifies the receipt status. Returns the tx hash, receipt, and error.
-func (e *executor) executeSwap(ctx context.Context, params executeSwapParams) (common.Hash, *types.Receipt, error) {
-	// ABI expects uint24 for poolFee and uint16 for feeBps — go-ethereum
-	// maps sub-32-bit uints to *big.Int, so we convert here.
-	poolFeeBig := new(big.Int).SetUint64(uint64(params.PoolFee))
-	feeBpsBig := new(big.Int).SetUint64(uint64(params.FeeBps))
+// activatePermitParams holds the data needed to activate a Permit2 allowance on-chain.
+type activatePermitParams struct {
+	User        common.Address
+	Token       common.Address
+	Amount      *big.Int // uint160
+	Expiration  uint64   // uint48
+	Nonce       uint64   // uint48
+	Spender     common.Address
+	SigDeadline *big.Int
+	Signature   []byte
+	Priority    Priority
+}
 
-	calldata, err := parsedSwapExecutorABI.Pack(
-		"executeSwap",
-		params.User,
-		params.TokenIn,
-		params.TokenOut,
-		poolFeeBig,
-		params.AmountIn,
-		params.MinAmountOut,
-		feeBpsBig,
-	)
+// executeSwap calls the appropriate SwapExecutor function on-chain based on the
+// execution mode, waits for the transaction to be mined, and verifies the receipt.
+func (e *executor) executeSwap(ctx context.Context, params executeSwapParams) (common.Hash, *types.Receipt, error) {
+	calldata, err := e.packSwapCalldata(params)
 	if err != nil {
 		return common.Hash{}, nil, fmt.Errorf("pack calldata: %w", err)
 	}
@@ -260,6 +274,194 @@ func parseAmountOutFromReceipt(receipt *types.Receipt, executorAddr common.Addre
 		}
 	}
 	return nil
+}
+
+// packSwapCalldata builds the ABI-encoded calldata for the appropriate swap function
+// based on the execution mode.
+func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
+	poolFeeBig := new(big.Int).SetUint64(uint64(params.PoolFee))
+	feeBpsBig := new(big.Int).SetUint64(uint64(params.FeeBps))
+
+	switch params.Mode {
+	case ExecModeLegacy:
+		// V1 contract: executeSwap(user, tokenIn, tokenOut, poolFee, amountIn, minAmountOut, feeBps)
+		return parsedSwapExecutorABI.Pack(
+			"executeSwap",
+			params.User,
+			params.TokenIn,
+			params.TokenOut,
+			poolFeeBig,
+			params.AmountIn,
+			params.MinAmountOut,
+			feeBpsBig,
+		)
+
+	case ExecModePermit2Allowance:
+		// V2 contract: executeSwapViaPermit2(user, tokenIn, tokenOut, poolFee, amountIn, minAmountOut, feeBps)
+		return parsedSwapExecutorV2ABI.Pack(
+			"executeSwapViaPermit2",
+			params.User,
+			params.TokenIn,
+			params.TokenOut,
+			poolFeeBig,
+			params.AmountIn,
+			params.MinAmountOut,
+			feeBpsBig,
+		)
+
+	case ExecModePermit2Signature:
+		// V2 contract: executeSwapWithSignature(user, tokenOut, poolFee, minAmountOut, feeBps, permitTransfer, signature)
+		// The permitTransfer struct is encoded as a tuple: ((token, amount), nonce, deadline)
+		type tokenPermissions struct {
+			Token  common.Address
+			Amount *big.Int
+		}
+		type permitTransferFrom struct {
+			Permitted tokenPermissions
+			Nonce     *big.Int
+			Deadline  *big.Int
+		}
+		permit := permitTransferFrom{
+			Permitted: tokenPermissions{
+				Token:  params.TokenIn,
+				Amount: params.AmountIn,
+			},
+			Nonce:    params.PermitNonce,
+			Deadline: params.PermitDeadline,
+		}
+		return parsedSwapExecutorV2ABI.Pack(
+			"executeSwapWithSignature",
+			params.User,
+			params.TokenOut,
+			poolFeeBig,
+			params.MinAmountOut,
+			feeBpsBig,
+			permit,
+			params.PermitSignature,
+		)
+
+	default:
+		return nil, fmt.Errorf("unknown execution mode: %d", params.Mode)
+	}
+}
+
+// activatePermit submits a transaction to activate a Permit2 allowance on-chain.
+// This is called once per position before the first level execution.
+func (e *executor) activatePermit(ctx context.Context, params activatePermitParams) (common.Hash, error) {
+	// Build the PermitSingle struct for the ABI call.
+	type permitDetails struct {
+		Token      common.Address
+		Amount     *big.Int
+		Expiration *big.Int
+		Nonce      *big.Int
+	}
+	type permitSingle struct {
+		Details     permitDetails
+		Spender     common.Address
+		SigDeadline *big.Int
+	}
+
+	ps := permitSingle{
+		Details: permitDetails{
+			Token:      params.Token,
+			Amount:     params.Amount,
+			Expiration: new(big.Int).SetUint64(params.Expiration),
+			Nonce:      new(big.Int).SetUint64(params.Nonce),
+		},
+		Spender:     params.Spender,
+		SigDeadline: params.SigDeadline,
+	}
+
+	calldata, err := parsedSwapExecutorV2ABI.Pack(
+		"activatePermit",
+		params.User,
+		ps,
+		params.Signature,
+	)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("pack activatePermit calldata: %w", err)
+	}
+
+	gasTipCap, maxFeeCap, err := e.suggestGasFees(ctx, params.Priority)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("suggest gas fees: %w", err)
+	}
+
+	gasLimit, err := e.client.EstimateGas(ctx, ethereum.CallMsg{
+		From:      e.keeperAddr,
+		To:        &e.executorAddr,
+		GasFeeCap: maxFeeCap,
+		GasTipCap: gasTipCap,
+		Data:      calldata,
+	})
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("estimate gas: %w", err)
+	}
+	gasLimit = e.applyGasBuffer(gasLimit, params.Priority)
+
+	nonce, err := e.acquireNonce(ctx)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("acquire nonce: %w", err)
+	}
+
+	tx := types.NewTx(&types.DynamicFeeTx{
+		ChainID:   e.chainID,
+		Nonce:     nonce,
+		GasTipCap: gasTipCap,
+		GasFeeCap: maxFeeCap,
+		Gas:       gasLimit,
+		To:        &e.executorAddr,
+		Value:     big.NewInt(0),
+		Data:      calldata,
+	})
+
+	signer := types.LatestSignerForChainID(e.chainID)
+	signedTx, err := types.SignTx(tx, signer, e.keeperKey)
+	if err != nil {
+		e.rollbackNonce(nonce)
+		return common.Hash{}, fmt.Errorf("sign tx: %w", err)
+	}
+
+	if err := e.client.SendTransaction(ctx, signedTx); err != nil {
+		e.rollbackNonce(nonce)
+		return common.Hash{}, fmt.Errorf("send tx: %w", err)
+	}
+
+	txHash := signedTx.Hash()
+	receipt, err := e.waitForReceipt(ctx, txHash)
+	if err != nil {
+		return txHash, fmt.Errorf("wait for receipt: %w", err)
+	}
+	if receipt.Status == 0 {
+		return txHash, fmt.Errorf("activatePermit tx reverted: %s", txHash.Hex())
+	}
+
+	return txHash, nil
+}
+
+// broadcastSignedApproveTx broadcasts a user-signed approve TX (for one-click flow).
+// The frontend silently signs token.approve(Permit2, MAX) and sends the signed TX bytes.
+// Keeper broadcasts it and waits for confirmation before proceeding with the swap.
+func (e *executor) broadcastSignedApproveTx(ctx context.Context, signedTxBytes []byte) (common.Hash, error) {
+	tx := new(types.Transaction)
+	if err := tx.UnmarshalBinary(signedTxBytes); err != nil {
+		return common.Hash{}, fmt.Errorf("decode signed approve tx: %w", err)
+	}
+
+	if err := e.client.SendTransaction(ctx, tx); err != nil {
+		return common.Hash{}, fmt.Errorf("broadcast approve tx: %w", err)
+	}
+
+	txHash := tx.Hash()
+	receipt, err := e.waitForReceipt(ctx, txHash)
+	if err != nil {
+		return txHash, fmt.Errorf("wait for approve receipt: %w", err)
+	}
+	if receipt.Status == 0 {
+		return txHash, fmt.Errorf("approve tx reverted: %s", txHash.Hex())
+	}
+
+	return txHash, nil
 }
 
 // computeMinAmountOut calculates the minimum acceptable output given a trigger price,

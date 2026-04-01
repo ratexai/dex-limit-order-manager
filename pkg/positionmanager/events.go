@@ -44,3 +44,14 @@ type ErrorEvent struct {
 	Err        error
 	Retryable  bool
 }
+
+// PermitExpiryEvent is emitted when a position's Permit2 permit is approaching expiry.
+// The host should notify the user to renew the permit via the /renew endpoint.
+type PermitExpiryEvent struct {
+	PositionID     [16]byte
+	Owner          common.Address
+	ChainID        uint64
+	PermitDeadline int64  // Unix timestamp when permit expires.
+	HoursRemaining int    // Hours until expiry.
+	ActiveLevels   int    // Number of active levels that will be suspended if not renewed.
+}

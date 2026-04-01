@@ -37,6 +37,10 @@ type Config struct {
 
 	// OnError is called when an execution fails.
 	OnError func(ErrorEvent)
+
+	// OnPermitExpiring is called when a position's permit is approaching expiry.
+	// Host uses this to notify the user to renew via the /renew endpoint.
+	OnPermitExpiring func(PermitExpiryEvent)
 }
 
 // ChainInstance bundles the chain client with chain-specific configuration.
@@ -82,7 +86,15 @@ type ChainConfig struct {
 
 	// CircuitBreaker config for executor resilience. Zero value = use defaults.
 	CircuitBreaker CircuitBreakerConfig
+
+	// Permit2.
+	Permit2Address    common.Address // Canonical: 0x000000000022D473030F116dDEE9F6B43aC78BA3.
+	MinPermitLifetime time.Duration  // Min remaining lifetime for new permits (default: 1h).
+	PermitExpiryWarning time.Duration // Warn host this long before permit expiry (default: 48h).
 }
+
+// permit2Addr is the canonical Permit2 address on all EVM chains.
+var permit2Addr = common.HexToAddress(Permit2CanonicalAddress)
 
 // EthereumDefaults returns sensible defaults for Ethereum mainnet.
 func EthereumDefaults() ChainConfig {
@@ -98,25 +110,52 @@ func EthereumDefaults() ChainConfig {
 		TPSlippageBps:      50,
 		UseFlashbots:       true,
 		FlashbotsRelay:     "https://relay.flashbots.net",
-		MaxRetries:         3,
-		RetryGasEscalation: 1.5,
+		MaxRetries:          3,
+		RetryGasEscalation:  1.5,
+		Permit2Address:      permit2Addr,
+		MinPermitLifetime:   1 * time.Hour,
+		PermitExpiryWarning: 48 * time.Hour,
 	}
 }
 
 // BaseDefaults returns sensible defaults for Base mainnet.
 func BaseDefaults() ChainConfig {
 	return ChainConfig{
-		ChainID:            8453,
-		Name:               "base",
-		BlockTime:          2 * time.Second,
-		ExecutorWorkers:    8,
-		SLGasMultiplier:    2.0,
-		TPGasMultiplier:    1.5,
-		MaxGasPrice:        new(big.Int).Mul(big.NewInt(1), big.NewInt(1e9)), // 1 gwei
-		SLSlippageBps:      200,
-		TPSlippageBps:      50,
-		UseFlashbots:       false,
-		MaxRetries:         3,
-		RetryGasEscalation: 1.5,
+		ChainID:             8453,
+		Name:                "base",
+		BlockTime:           2 * time.Second,
+		ExecutorWorkers:     8,
+		SLGasMultiplier:     2.0,
+		TPGasMultiplier:     1.5,
+		MaxGasPrice:         new(big.Int).Mul(big.NewInt(1), big.NewInt(1e9)), // 1 gwei
+		SLSlippageBps:       200,
+		TPSlippageBps:       50,
+		UseFlashbots:        false,
+		MaxRetries:          3,
+		RetryGasEscalation:  1.5,
+		Permit2Address:      permit2Addr,
+		MinPermitLifetime:   1 * time.Hour,
+		PermitExpiryWarning: 48 * time.Hour,
+	}
+}
+
+// BSCDefaults returns sensible defaults for BSC mainnet (PancakeSwap V3).
+func BSCDefaults() ChainConfig {
+	return ChainConfig{
+		ChainID:             56,
+		Name:                "bsc",
+		BlockTime:           3 * time.Second,
+		ExecutorWorkers:     6,
+		SLGasMultiplier:     2.0,
+		TPGasMultiplier:     1.5,
+		MaxGasPrice:         new(big.Int).Mul(big.NewInt(5), big.NewInt(1e9)), // 5 gwei
+		SLSlippageBps:       200,
+		TPSlippageBps:       50,
+		UseFlashbots:        false, // No Flashbots on BSC, use private RPCs if needed.
+		MaxRetries:          3,
+		RetryGasEscalation:  1.5,
+		Permit2Address:      permit2Addr,
+		MinPermitLifetime:   1 * time.Hour,
+		PermitExpiryWarning: 48 * time.Hour,
 	}
 }
