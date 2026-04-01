@@ -2,6 +2,7 @@ package positionmanager
 
 import (
 	"crypto/ecdsa"
+	"log/slog"
 	"math/big"
 	"time"
 
@@ -21,6 +22,10 @@ type Config struct {
 
 	// Chains maps chainID to chain-specific configuration and client.
 	Chains map[uint64]ChainInstance
+
+	// Logger for structured logging. If nil, a no-op logger is used.
+	// Host provides (e.g. slog.Default() or custom handler).
+	Logger *slog.Logger
 
 	// OnExecution is called after each successful level execution.
 	// Host uses this for logging, notifications, referral tracking.

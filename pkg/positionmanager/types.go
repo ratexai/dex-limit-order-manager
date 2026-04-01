@@ -119,6 +119,11 @@ type Position struct {
 	UpdatedAt     int64
 }
 
+// Pair returns the TokenPair for this position.
+func (p *Position) Pair() TokenPair {
+	return TokenPair{Base: p.TokenBase, Quote: p.TokenQuote, ChainID: p.ChainID}
+}
+
 // ActiveLevels returns levels that are still active (not triggered or cancelled).
 func (p *Position) ActiveLevels() []Level {
 	var result []Level

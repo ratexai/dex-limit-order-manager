@@ -60,13 +60,11 @@ func computeFeeResult(amountIn *big.Int, cfg *FeeConfig) FeeResult {
 		}
 	}
 
-	totalFee := new(big.Int).Mul(amountIn, big.NewInt(int64(cfg.FeeBps)))
-	totalFee.Div(totalFee, big.NewInt(10000))
+	totalFee := mulBps(amountIn, cfg.FeeBps)
 
 	var referralShare *big.Int
 	if cfg.ReferrerShare > 0 && cfg.Referrer != (common.Address{}) {
-		referralShare = new(big.Int).Mul(totalFee, big.NewInt(int64(cfg.ReferrerShare)))
-		referralShare.Div(referralShare, big.NewInt(10000))
+		referralShare = mulBps(totalFee, cfg.ReferrerShare)
 	} else {
 		referralShare = new(big.Int)
 	}
