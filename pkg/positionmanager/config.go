@@ -27,6 +27,10 @@ type Config struct {
 	// Host provides (e.g. slog.Default() or custom handler).
 	Logger *slog.Logger
 
+	// Metrics collector. If nil, a default instance is created.
+	// Host can read metrics via Metrics.Snapshot() for Prometheus/Datadog export.
+	Metrics *Metrics
+
 	// OnExecution is called after each successful level execution.
 	// Host uses this for logging, notifications, referral tracking.
 	OnExecution func(ExecutionEvent)
@@ -45,6 +49,10 @@ type ChainInstance struct {
 
 	// ExecutorAddress is the deployed SwapExecutor contract address.
 	ExecutorAddress common.Address
+
+	// CircuitBreaker pauses execution after consecutive failures. Optional.
+	// If nil, no circuit breaking is applied.
+	CircuitBreaker *CircuitBreaker
 
 	// Chain-specific parameters.
 	ChainConfig

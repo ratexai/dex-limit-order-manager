@@ -3,6 +3,32 @@
 //
 // It is designed as a library that integrates into a host application
 // (e.g. RateXAI finance layer) via dependency injection through interfaces.
+//
+// # Owner Authentication — Host Responsibility
+//
+// This library does NOT authenticate position owners. All CRUD methods
+// (OpenPosition, CancelPosition, UpdateLevel, AddLevel, RemoveLevel)
+// accept a position ID and execute unconditionally.
+//
+// The host application MUST enforce ownership checks before calling
+// these methods. Typical pattern:
+//
+//	// In your API handler:
+//	pos, err := mgr.GetPosition(ctx, posID)
+//	if err != nil { return err }
+//	if pos.Owner != authenticatedUser {
+//	    return ErrForbidden
+//	}
+//	return mgr.CancelPosition(ctx, posID)
+//
+// The library trusts that the host has already verified the caller's
+// identity and authorization. This boundary exists because authentication
+// strategies vary widely (JWT, session, API key, wallet signature) and
+// are the host's domain, not the library's.
+//
+// Similarly, the library does not enforce per-user position limits,
+// rate limiting, or spending caps. These are business rules that belong
+// in the host layer.
 package positionmanager
 
 import (
