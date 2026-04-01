@@ -18,6 +18,7 @@ import (
 type Manager struct {
 	cfg       Config
 	log       *slog.Logger
+	metrics   MetricsCollector
 	trigger   *TriggerEngine
 	executors map[uint64]*executor // chainID → executor
 	posLocks  positionLockMap      // Per-position mutex to serialize executions.
@@ -49,6 +50,28 @@ func (m *positionLockMap) Unlock(id [16]byte) {
 	lk := m.locks[id]
 	m.mu.Unlock()
 	lk.Unlock()
+}
+
+// Cleanup removes mutexes for the given position IDs (e.g. closed/cancelled).
+// Only call when no goroutine holds the lock for these IDs.
+func (m *positionLockMap) Cleanup(ids [][16]byte) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	removed := 0
+	for _, id := range ids {
+		if _, ok := m.locks[id]; ok {
+			delete(m.locks, id)
+			removed++
+		}
+	}
+	return removed
+}
+
+// Len returns the number of tracked position locks.
+func (m *positionLockMap) Len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.locks)
 }
 
 // New creates a new Manager with the given configuration.
@@ -83,9 +106,15 @@ func New(cfg Config) (*Manager, error) {
 		logger = slog.Default()
 	}
 
+	metrics := cfg.Metrics
+	if metrics == nil {
+		metrics = noopMetrics{}
+	}
+
 	return &Manager{
 		cfg:       cfg,
 		log:       logger,
+		metrics:   metrics,
 		trigger:   NewTriggerEngine(),
 		executors: executors,
 	}, nil
@@ -197,11 +226,14 @@ func (m *Manager) handlePriceUpdate(ctx context.Context, update PriceUpdate, exe
 // executeTrigger handles a single trigger event: execute swap, update state.
 // Per-position locking ensures concurrent triggers for the same position are serialized.
 func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
+	execStart := time.Now()
+
 	m.posLocks.Lock(evt.PositionID)
 	defer m.posLocks.Unlock(evt.PositionID)
 
 	pos, err := m.cfg.Store.Get(ctx, evt.PositionID)
 	if err != nil {
+		m.metrics.IncErrorTotal(evt.ChainID, "store_get")
 		m.emitError(ErrorEvent{PositionID: evt.PositionID, LevelIndex: evt.LevelIndex, ChainID: evt.ChainID, Err: err})
 		return
 	}
@@ -231,6 +263,7 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 	// Get fee config.
 	feeCfg, err := m.cfg.FeeProvider.GetFee(ctx, pos.Owner)
 	if err != nil {
+		m.metrics.IncErrorTotal(pos.ChainID, "get_fee")
 		m.emitError(ErrorEvent{PositionID: evt.PositionID, LevelIndex: evt.LevelIndex, ChainID: evt.ChainID, Err: fmt.Errorf("get fee: %w", err)})
 		return
 	}
@@ -255,6 +288,18 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		feeBps = feeCfg.FeeBps
 	}
 
+	// Check circuit breaker before executing.
+	if cb := exec.circuitBreaker; cb != nil {
+		if err := cb.Allow(); err != nil {
+			m.metrics.IncErrorTotal(pos.ChainID, "circuit_open")
+			// Re-register trigger for retry after circuit resets.
+			pair := pos.Pair()
+			m.trigger.Register(pair, pos.ID, evt.LevelIndex, level.Type, pos.Direction, level.TriggerPrice)
+			m.emitError(ErrorEvent{PositionID: evt.PositionID, LevelIndex: evt.LevelIndex, ChainID: evt.ChainID, Err: err, Retryable: true})
+			return
+		}
+	}
+
 	// Execute on-chain swap and wait for receipt.
 	txHash, receipt, err := exec.executeSwap(ctx, executeSwapParams{
 		User:         pos.Owner,
@@ -267,6 +312,10 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		Priority:     priority,
 	})
 	if err != nil {
+		if exec.circuitBreaker != nil {
+			exec.circuitBreaker.RecordFailure()
+		}
+		m.metrics.IncErrorTotal(pos.ChainID, "execute_swap")
 		m.log.Error("swap execution failed",
 			"position", fmt.Sprintf("%x", evt.PositionID[:8]),
 			"level", evt.LevelIndex,
@@ -294,6 +343,21 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 			Retryable:  true,
 		})
 		return
+	}
+
+	if exec.circuitBreaker != nil {
+		exec.circuitBreaker.RecordSuccess()
+	}
+
+	// Record metrics for successful execution.
+	m.metrics.IncTriggerCount(pos.ChainID, level.Type.String(), pos.Direction.String())
+	m.metrics.ObserveExecutionLatency(pos.ChainID, level.Type.String(), time.Since(execStart))
+	if receipt != nil {
+		gasPrice := uint64(0)
+		if receipt.EffectiveGasPrice != nil {
+			gasPrice = receipt.EffectiveGasPrice.Uint64()
+		}
+		m.metrics.ObserveGasSpent(pos.ChainID, level.Type.String(), receipt.GasUsed, gasPrice)
 	}
 
 	// Parse actual amountOut from receipt logs.
@@ -359,6 +423,7 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 
 	// Persist.
 	if err := m.cfg.Store.Update(ctx, pos); err != nil {
+		m.metrics.IncErrorTotal(pos.ChainID, "store_update")
 		m.emitError(ErrorEvent{PositionID: pos.ID, ChainID: pos.ChainID, Err: fmt.Errorf("store update: %w", err)})
 	}
 
@@ -689,6 +754,38 @@ func (m *Manager) cancelActiveLevels(pos *Position, pair TokenPair, exceptIdx in
 			m.trigger.Unregister(pair, pos.ID, i)
 		}
 	}
+}
+
+// CleanupClosedPositionLocks removes mutexes for positions in terminal states.
+// Call periodically (e.g. every few minutes) to prevent unbounded lock map growth.
+// Safe to call concurrently with Run().
+func (m *Manager) CleanupClosedPositionLocks(ctx context.Context) (int, error) {
+	var terminalIDs [][16]byte
+	for chainID := range m.cfg.Chains {
+		positions, err := m.cfg.Store.ListActive(ctx, chainID)
+		if err != nil {
+			return 0, fmt.Errorf("list active for chain %d: %w", chainID, err)
+		}
+		activeSet := make(map[[16]byte]bool, len(positions))
+		for _, p := range positions {
+			activeSet[p.ID] = true
+		}
+
+		m.posLocks.mu.Lock()
+		for id := range m.posLocks.locks {
+			if !activeSet[id] {
+				terminalIDs = append(terminalIDs, id)
+			}
+		}
+		m.posLocks.mu.Unlock()
+	}
+
+	if len(terminalIDs) == 0 {
+		return 0, nil
+	}
+	removed := m.posLocks.Cleanup(terminalIDs)
+	m.log.Info("cleaned up position locks", "removed", removed, "remaining", m.posLocks.Len())
+	return removed, nil
 }
 
 func (m *Manager) emitError(evt ErrorEvent) {

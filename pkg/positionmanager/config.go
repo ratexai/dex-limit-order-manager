@@ -27,6 +27,10 @@ type Config struct {
 	// Host provides (e.g. slog.Default() or custom handler).
 	Logger *slog.Logger
 
+	// Metrics collects operational metrics (trigger counts, latency, gas, errors).
+	// Host provides a Prometheus-backed implementation. Nil = no-op.
+	Metrics MetricsCollector
+
 	// OnExecution is called after each successful level execution.
 	// Host uses this for logging, notifications, referral tracking.
 	OnExecution func(ExecutionEvent)
@@ -73,8 +77,11 @@ type ChainConfig struct {
 	FlashbotsRelay  string
 
 	// Retry.
-	MaxRetries      int
+	MaxRetries         int
 	RetryGasEscalation float64 // Gas multiplier on each retry (e.g. 1.5).
+
+	// CircuitBreaker config for executor resilience. Zero value = use defaults.
+	CircuitBreaker CircuitBreakerConfig
 }
 
 // EthereumDefaults returns sensible defaults for Ethereum mainnet.

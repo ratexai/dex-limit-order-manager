@@ -7,7 +7,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-func testPair() TokenPair {
+func triggerTestPair() TokenPair {
 	return TokenPair{
 		Base:    common.HexToAddress("0x1111111111111111111111111111111111111111"),
 		Quote:   common.HexToAddress("0x2222222222222222222222222222222222222222"),
@@ -23,7 +23,7 @@ func posID(b byte) [16]byte {
 
 func TestTriggerEngine_LongTP(t *testing.T) {
 	e := NewTriggerEngine()
-	pair := testPair()
+	pair := triggerTestPair()
 
 	// Register TP at 2200 for a Long position.
 	e.Register(pair, posID(1), 1, LevelTypeTP, Long, big.NewInt(220000000000)) // 2200e8
@@ -52,7 +52,7 @@ func TestTriggerEngine_LongTP(t *testing.T) {
 
 func TestTriggerEngine_LongSL(t *testing.T) {
 	e := NewTriggerEngine()
-	pair := testPair()
+	pair := triggerTestPair()
 
 	// Register SL at 1800 for a Long position.
 	e.Register(pair, posID(1), 0, LevelTypeSL, Long, big.NewInt(180000000000))
@@ -75,7 +75,7 @@ func TestTriggerEngine_LongSL(t *testing.T) {
 
 func TestTriggerEngine_MultipleTPTrigger(t *testing.T) {
 	e := NewTriggerEngine()
-	pair := testPair()
+	pair := triggerTestPair()
 
 	// Register 3 TPs for a Long position.
 	e.Register(pair, posID(1), 1, LevelTypeTP, Long, big.NewInt(220000000000)) // 2200
@@ -96,7 +96,7 @@ func TestTriggerEngine_MultipleTPTrigger(t *testing.T) {
 
 func TestTriggerEngine_UpdateTriggerPrice(t *testing.T) {
 	e := NewTriggerEngine()
-	pair := testPair()
+	pair := triggerTestPair()
 
 	// SL at 1800.
 	e.Register(pair, posID(1), 0, LevelTypeSL, Long, big.NewInt(180000000000))
@@ -119,7 +119,7 @@ func TestTriggerEngine_UpdateTriggerPrice(t *testing.T) {
 
 func TestTriggerEngine_UnregisterPosition(t *testing.T) {
 	e := NewTriggerEngine()
-	pair := testPair()
+	pair := triggerTestPair()
 
 	e.Register(pair, posID(1), 0, LevelTypeSL, Long, big.NewInt(180000000000))
 	e.Register(pair, posID(1), 1, LevelTypeTP, Long, big.NewInt(220000000000))
@@ -138,7 +138,7 @@ func TestTriggerEngine_UnregisterPosition(t *testing.T) {
 
 func TestTriggerEngine_ShortPosition(t *testing.T) {
 	e := NewTriggerEngine()
-	pair := testPair()
+	pair := triggerTestPair()
 
 	// Short: SL fires when price goes UP, TP fires when price goes DOWN.
 	e.Register(pair, posID(1), 0, LevelTypeSL, Short, big.NewInt(220000000000)) // SL at 2200

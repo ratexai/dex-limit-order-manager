@@ -41,6 +41,7 @@ type UniswapV3PriceFeed struct {
 	prices  map[TokenPair]cachedPrice
 	subs    map[TokenPair][]chan PriceUpdate
 	polling map[TokenPair]context.CancelFunc // Cancel func per poll loop.
+	pollWg  sync.WaitGroup                   // Tracks running poll loops for graceful shutdown.
 }
 
 type poolConfig struct {
@@ -104,7 +105,11 @@ func (f *UniswapV3PriceFeed) Subscribe(ctx context.Context, pair TokenPair) (<-c
 		// Start poll loop with its own context, independent of subscriber ctx.
 		pollCtx, cancel := context.WithCancel(context.Background())
 		f.polling[pair] = cancel
-		go f.pollLoop(pollCtx, pair)
+		f.pollWg.Add(1)
+		go func() {
+			defer f.pollWg.Done()
+			f.pollLoop(pollCtx, pair)
+		}()
 	}
 	f.mu.Unlock()
 
@@ -153,11 +158,9 @@ func (f *UniswapV3PriceFeed) Latest(pair TokenPair) (*big.Int, int64, error) {
 	return new(big.Int).Set(cached.price), cached.timestamp, nil
 }
 
-// Close stops all poll loops.
+// Close stops all poll loops and waits for them to finish.
 func (f *UniswapV3PriceFeed) Close() {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	for pair, cancel := range f.polling {
 		cancel()
 		for _, ch := range f.subs[pair] {
@@ -165,6 +168,40 @@ func (f *UniswapV3PriceFeed) Close() {
 		}
 		delete(f.subs, pair)
 		delete(f.polling, pair)
+	}
+	f.mu.Unlock()
+
+	// Wait for all poll loops to exit.
+	f.pollWg.Wait()
+}
+
+// Shutdown gracefully stops the price feed, respecting the context deadline.
+// If ctx expires before all poll loops finish, returns ctx.Err().
+func (f *UniswapV3PriceFeed) Shutdown(ctx context.Context) error {
+	// Signal all poll loops to stop.
+	f.mu.Lock()
+	for pair, cancel := range f.polling {
+		cancel()
+		for _, ch := range f.subs[pair] {
+			close(ch)
+		}
+		delete(f.subs, pair)
+		delete(f.polling, pair)
+	}
+	f.mu.Unlock()
+
+	// Wait for poll loops with deadline.
+	done := make(chan struct{})
+	go func() {
+		f.pollWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

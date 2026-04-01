@@ -22,6 +22,7 @@ type executor struct {
 	executorAddr    common.Address
 	chainID         *big.Int
 	cfg             ChainConfig
+	circuitBreaker  *CircuitBreaker
 
 	nonceMu   sync.Mutex
 	nextNonce uint64
@@ -29,13 +30,20 @@ type executor struct {
 }
 
 func newExecutor(client ChainClient, keeperKey *ecdsa.PrivateKey, executorAddr common.Address, chainID uint64, cfg ChainConfig) *executor {
+	var cb *CircuitBreaker
+	if cfg.CircuitBreaker.MaxFailures > 0 {
+		cb = NewCircuitBreaker(cfg.CircuitBreaker)
+	} else {
+		cb = NewCircuitBreaker(DefaultCircuitBreakerConfig())
+	}
 	return &executor{
-		client:       client,
-		keeperKey:    keeperKey,
-		keeperAddr:   crypto.PubkeyToAddress(keeperKey.PublicKey),
-		executorAddr: executorAddr,
-		chainID:      new(big.Int).SetUint64(chainID),
-		cfg:          cfg,
+		client:         client,
+		keeperKey:      keeperKey,
+		keeperAddr:     crypto.PubkeyToAddress(keeperKey.PublicKey),
+		executorAddr:   executorAddr,
+		chainID:        new(big.Int).SetUint64(chainID),
+		cfg:            cfg,
+		circuitBreaker: cb,
 	}
 }
 
