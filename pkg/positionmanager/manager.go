@@ -137,6 +137,14 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
+
+	// Start permit expiry monitor.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		m.runPermitExpiryMonitor(ctx)
+	}()
+
 	for chainID, ci := range m.cfg.Chains {
 		wg.Add(1)
 		go func(chainID uint64, ci ChainInstance) {
@@ -300,6 +308,63 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		}
 	}
 
+	// Determine execution mode.
+	execMode := ExecModeLegacy
+	if len(pos.PermitSignature) > 0 {
+		// Check permit not expired.
+		if pos.PermitDeadline > 0 && pos.PermitDeadline <= time.Now().Unix() {
+			// Permit expired — suspend levels and notify host.
+			m.suspendPositionLevels(pos)
+			if err := m.cfg.Store.Update(ctx, pos); err != nil {
+				m.emitError(ErrorEvent{PositionID: pos.ID, ChainID: pos.ChainID, Err: fmt.Errorf("store update: %w", err)})
+			}
+			m.emitError(ErrorEvent{
+				PositionID: evt.PositionID,
+				LevelIndex: evt.LevelIndex,
+				ChainID:    evt.ChainID,
+				Err:        fmt.Errorf("permit expired at %d", pos.PermitDeadline),
+				Retryable:  false,
+			})
+			return
+		}
+
+		execMode = ExecModePermit2Allowance
+
+		// Activate Permit2 allowance on-chain if not yet done.
+		if !pos.PermitActivated {
+			ci := m.cfg.Chains[pos.ChainID]
+			_, err := exec.activatePermit(ctx, activatePermitParams{
+				User:        pos.Owner,
+				Token:       pos.PermitToken,
+				Amount:      pos.PermitAmount,
+				Expiration:  uint64(pos.PermitDeadline),
+				Nonce:       pos.PermitNonce.Uint64(),
+				Spender:     ci.ExecutorAddress,
+				SigDeadline: new(big.Int).SetInt64(pos.PermitDeadline),
+				Signature:   pos.PermitSignature,
+				Priority:    priority,
+			})
+			if err != nil {
+				m.metrics.IncErrorTotal(pos.ChainID, "activate_permit")
+				pair := pos.Pair()
+				m.trigger.Register(pair, pos.ID, evt.LevelIndex, level.Type, pos.Direction, level.TriggerPrice)
+				m.emitError(ErrorEvent{
+					PositionID: evt.PositionID,
+					LevelIndex: evt.LevelIndex,
+					ChainID:    evt.ChainID,
+					Err:        fmt.Errorf("activate permit: %w", err),
+					Retryable:  true,
+				})
+				return
+			}
+			pos.PermitActivated = true
+			pos.UpdatedAt = time.Now().Unix()
+			if err := m.cfg.Store.Update(ctx, pos); err != nil {
+				m.log.Error("failed to persist permit activation", "error", err)
+			}
+		}
+	}
+
 	// Execute on-chain swap and wait for receipt.
 	txHash, receipt, err := exec.executeSwap(ctx, executeSwapParams{
 		User:         pos.Owner,
@@ -310,6 +375,7 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		MinAmountOut: minAmountOut,
 		FeeBps:       feeBps,
 		Priority:     priority,
+		Mode:         execMode,
 	})
 	if err != nil {
 		if exec.circuitBreaker != nil {
@@ -499,6 +565,56 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 		return nil, fmt.Errorf("total PortionBps %d exceeds 10000", totalPortionBps)
 	}
 
+	// Validate Permit2 authorization if provided.
+	var permitToken common.Address
+	if len(params.PermitSignature) > 0 {
+		ci := m.cfg.Chains[params.ChainID]
+
+		// Determine expected tokenIn based on direction.
+		if params.Direction == Long {
+			permitToken = params.TokenBase
+		} else {
+			permitToken = params.TokenQuote
+		}
+
+		permitData := PermitSingleData{
+			Token:       permitToken,
+			Amount:      params.Size,
+			Expiration:  uint64(params.PermitDeadline),
+			Nonce:       0,
+			Spender:     ci.ExecutorAddress,
+			SigDeadline: new(big.Int).SetInt64(params.PermitDeadline),
+		}
+		if params.PermitNonce != nil {
+			permitData.Nonce = params.PermitNonce.Uint64()
+		}
+
+		if err := ValidatePermitForPosition(
+			params.Owner,
+			params.Size,
+			permitToken,
+			permitData,
+			params.ChainID,
+			ci.ChainConfig.Permit2Address,
+			ci.ExecutorAddress,
+			params.PermitSignature,
+			ci.ChainConfig.MinPermitLifetime,
+		); err != nil {
+			return nil, fmt.Errorf("permit validation: %w", err)
+		}
+	}
+
+	// Broadcast signed approve TX if provided (one-click flow).
+	if len(params.SignedApproveTx) > 0 {
+		exec, ok := m.executors[params.ChainID]
+		if !ok {
+			return nil, fmt.Errorf("unsupported chain %d", params.ChainID)
+		}
+		if _, err := exec.broadcastSignedApproveTx(ctx, params.SignedApproveTx); err != nil {
+			return nil, fmt.Errorf("broadcast approve tx: %w", err)
+		}
+	}
+
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, fmt.Errorf("generate ID: %w", err)
@@ -536,6 +652,19 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 			level.MoveSLTo = new(big.Int).Set(lp.MoveSLTo)
 		}
 		pos.Levels = append(pos.Levels, level)
+	}
+
+	// Store Permit2 data on position if provided.
+	if len(params.PermitSignature) > 0 {
+		pos.PermitSignature = params.PermitSignature
+		pos.PermitDeadline = params.PermitDeadline
+		pos.PermitAmount = new(big.Int).Set(params.Size)
+		pos.PermitToken = permitToken
+		if params.PermitNonce != nil {
+			pos.PermitNonce = new(big.Int).Set(params.PermitNonce)
+		} else {
+			pos.PermitNonce = new(big.Int)
+		}
 	}
 
 	if err := m.cfg.Store.Save(ctx, pos); err != nil {
@@ -653,10 +782,18 @@ func (m *Manager) RemoveLevel(ctx context.Context, posID [16]byte, levelIdx int)
 }
 
 // MarketSwap executes an immediate market swap (no trigger engine).
+// Supports legacy (direct approve), Permit2 SignatureTransfer, and native ETH modes.
 func (m *Manager) MarketSwap(ctx context.Context, params MarketSwapParams) (*SwapResult, error) {
 	exec, ok := m.executors[params.ChainID]
 	if !ok {
 		return nil, fmt.Errorf("unsupported chain %d", params.ChainID)
+	}
+
+	// Broadcast signed approve TX if provided (one-click flow).
+	if len(params.SignedApproveTx) > 0 {
+		if _, err := exec.broadcastSignedApproveTx(ctx, params.SignedApproveTx); err != nil {
+			return nil, fmt.Errorf("broadcast approve tx: %w", err)
+		}
 	}
 
 	feeCfg, err := m.cfg.FeeProvider.GetFee(ctx, params.Owner)
@@ -678,15 +815,30 @@ func (m *Manager) MarketSwap(ctx context.Context, params MarketSwapParams) (*Swa
 		feeBps = feeCfg.FeeBps
 	}
 
+	// Determine execution mode.
+	execMode := ExecModeLegacy
+	var permitNonce, permitDeadline *big.Int
+	var permitSig []byte
+	if len(params.PermitSignature) > 0 {
+		execMode = ExecModePermit2Signature
+		permitSig = params.PermitSignature
+		permitNonce = params.PermitNonce
+		permitDeadline = new(big.Int).SetInt64(params.PermitDeadline)
+	}
+
 	txHash, receipt, err := exec.executeSwap(ctx, executeSwapParams{
-		User:         params.Owner,
-		TokenIn:      params.TokenIn,
-		TokenOut:     params.TokenOut,
-		PoolFee:      params.PoolFee,
-		AmountIn:     params.AmountIn,
-		MinAmountOut: minAmountOut,
-		FeeBps:       feeBps,
-		Priority:     PriorityNormal,
+		User:            params.Owner,
+		TokenIn:         params.TokenIn,
+		TokenOut:        params.TokenOut,
+		PoolFee:         params.PoolFee,
+		AmountIn:        params.AmountIn,
+		MinAmountOut:    minAmountOut,
+		FeeBps:          feeBps,
+		Priority:        PriorityNormal,
+		Mode:            execMode,
+		PermitNonce:     permitNonce,
+		PermitDeadline:  permitDeadline,
+		PermitSignature: permitSig,
 	})
 	if err != nil {
 		return nil, err
@@ -786,6 +938,134 @@ func (m *Manager) CleanupClosedPositionLocks(ctx context.Context) (int, error) {
 	removed := m.posLocks.Cleanup(terminalIDs)
 	m.log.Info("cleaned up position locks", "removed", removed, "remaining", m.posLocks.Len())
 	return removed, nil
+}
+
+// suspendPositionLevels marks all active levels as suspended (permit expired).
+func (m *Manager) suspendPositionLevels(pos *Position) {
+	pair := pos.Pair()
+	for i := range pos.Levels {
+		if pos.Levels[i].Status == LevelActive {
+			pos.Levels[i].Status = LevelSuspended
+			m.trigger.Unregister(pair, pos.ID, i)
+		}
+	}
+	pos.UpdatedAt = time.Now().Unix()
+}
+
+// RenewPermit updates a position's permit data after the user signs a new one.
+// Reactivates any suspended levels.
+func (m *Manager) RenewPermit(ctx context.Context, posID [16]byte, signature []byte, nonce *big.Int, deadline int64, amount *big.Int) error {
+	pos, err := m.cfg.Store.Get(ctx, posID)
+	if err != nil {
+		return err
+	}
+	if pos.State.IsTerminal() {
+		return fmt.Errorf("position is %s", pos.State)
+	}
+
+	pos.PermitSignature = signature
+	if nonce != nil {
+		pos.PermitNonce = new(big.Int).Set(nonce)
+	}
+	pos.PermitDeadline = deadline
+	if amount != nil {
+		pos.PermitAmount = new(big.Int).Set(amount)
+	}
+	pos.PermitActivated = false // Needs re-activation on-chain.
+	pos.UpdatedAt = time.Now().Unix()
+
+	// Reactivate suspended levels.
+	pair := pos.Pair()
+	reactivated := 0
+	for i := range pos.Levels {
+		if pos.Levels[i].Status == LevelSuspended {
+			pos.Levels[i].Status = LevelActive
+			m.trigger.Register(pair, pos.ID, i, pos.Levels[i].Type, pos.Direction, pos.Levels[i].TriggerPrice)
+			reactivated++
+		}
+	}
+
+	m.log.Info("permit renewed",
+		"position", fmt.Sprintf("%x", pos.ID[:8]),
+		"reactivated_levels", reactivated,
+		"new_deadline", deadline,
+	)
+
+	return m.cfg.Store.Update(ctx, pos)
+}
+
+// runPermitExpiryMonitor periodically checks for positions with expiring permits
+// and notifies the host via OnPermitExpiring callback.
+func (m *Manager) runPermitExpiryMonitor(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.checkPermitExpiry(ctx)
+		}
+	}
+}
+
+func (m *Manager) checkPermitExpiry(ctx context.Context) {
+	if m.cfg.OnPermitExpiring == nil {
+		return
+	}
+
+	now := time.Now().Unix()
+
+	for chainID, ci := range m.cfg.Chains {
+		positions, err := m.cfg.Store.ListActive(ctx, chainID)
+		if err != nil {
+			m.log.Error("permit expiry check: list active", "chain", chainID, "error", err)
+			continue
+		}
+
+		warningThreshold := ci.ChainConfig.PermitExpiryWarning
+		if warningThreshold == 0 {
+			warningThreshold = 48 * time.Hour
+		}
+
+		for _, pos := range positions {
+			if len(pos.PermitSignature) == 0 || pos.PermitDeadline == 0 {
+				continue
+			}
+
+			remaining := time.Duration(pos.PermitDeadline-now) * time.Second
+			if remaining <= 0 {
+				// Already expired — suspend if not already done.
+				hasActive := false
+				for _, l := range pos.Levels {
+					if l.Status == LevelActive {
+						hasActive = true
+						break
+					}
+				}
+				if hasActive {
+					m.suspendPositionLevels(pos)
+					_ = m.cfg.Store.Update(ctx, pos)
+				}
+			} else if remaining <= warningThreshold {
+				activeLevels := 0
+				for _, l := range pos.Levels {
+					if l.Status == LevelActive {
+						activeLevels++
+					}
+				}
+				m.cfg.OnPermitExpiring(PermitExpiryEvent{
+					PositionID:     pos.ID,
+					Owner:          pos.Owner,
+					ChainID:        pos.ChainID,
+					PermitDeadline: pos.PermitDeadline,
+					HoursRemaining: int(remaining.Hours()),
+					ActiveLevels:   activeLevels,
+				})
+			}
+		}
+	}
 }
 
 func (m *Manager) emitError(evt ErrorEvent) {
