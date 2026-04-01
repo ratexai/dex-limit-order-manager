@@ -78,7 +78,7 @@ Position Manager — один из модулей.
 ### Использование из host app:
 
 ```go
-import pm "github.com/yura4gus/dexwallettrust/pkg/positionmanager"
+import pm "github.com/ratexai/dex-limit-order-manager/pkg/positionmanager"
 
 // Host предоставляет зависимости
 mgr, err := pm.New(pm.Config{

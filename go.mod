@@ -1,4 +1,4 @@
-module github.com/yura4gus/dexwallettrust
+module github.com/ratexai/dex-limit-order-manager
 
 go 1.22
 
