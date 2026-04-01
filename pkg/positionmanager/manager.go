@@ -18,6 +18,7 @@ import (
 type Manager struct {
 	cfg       Config
 	log       *slog.Logger
+	metrics   *Metrics
 	trigger   *TriggerEngine
 	executors map[uint64]*executor // chainID → executor
 	posLocks  positionLockMap      // Per-position mutex to serialize executions.
@@ -49,6 +50,13 @@ func (m *positionLockMap) Unlock(id [16]byte) {
 	lk := m.locks[id]
 	m.mu.Unlock()
 	lk.Unlock()
+}
+
+// Remove deletes a position's mutex from the map (call after terminal state).
+func (m *positionLockMap) Remove(id [16]byte) {
+	m.mu.Lock()
+	delete(m.locks, id)
+	m.mu.Unlock()
 }
 
 // New creates a new Manager with the given configuration.
@@ -83,13 +91,22 @@ func New(cfg Config) (*Manager, error) {
 		logger = slog.Default()
 	}
 
+	metrics := cfg.Metrics
+	if metrics == nil {
+		metrics = NewMetrics()
+	}
+
 	return &Manager{
 		cfg:       cfg,
 		log:       logger,
+		metrics:   metrics,
 		trigger:   NewTriggerEngine(),
 		executors: executors,
 	}, nil
 }
+
+// Metrics returns the metrics collector for host-side export.
+func (m *Manager) Metrics() *Metrics { return m.metrics }
 
 // Run starts the keeper loop. It blocks until ctx is cancelled.
 // It loads active positions, subscribes to price feeds, and dispatches triggers.
@@ -197,6 +214,9 @@ func (m *Manager) handlePriceUpdate(ctx context.Context, update PriceUpdate, exe
 // executeTrigger handles a single trigger event: execute swap, update state.
 // Per-position locking ensures concurrent triggers for the same position are serialized.
 func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
+	m.metrics.incTriggersFired()
+	execStart := time.Now()
+
 	m.posLocks.Lock(evt.PositionID)
 	defer m.posLocks.Unlock(evt.PositionID)
 
@@ -221,6 +241,18 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 	exec, ok := m.executors[pos.ChainID]
 	if !ok {
 		m.emitError(ErrorEvent{PositionID: evt.PositionID, ChainID: evt.ChainID, Err: fmt.Errorf("no executor for chain %d", pos.ChainID)})
+		return
+	}
+
+	// Check circuit breaker — skip execution if breaker is open.
+	ci := m.cfg.Chains[pos.ChainID]
+	if ci.CircuitBreaker != nil && !ci.CircuitBreaker.Allow() {
+		m.log.Warn("circuit breaker open, re-registering trigger",
+			"position", fmt.Sprintf("%x", evt.PositionID[:8]),
+			"chain", pos.ChainID,
+		)
+		pair := pos.Pair()
+		m.trigger.Register(pair, pos.ID, evt.LevelIndex, level.Type, pos.Direction, level.TriggerPrice)
 		return
 	}
 
@@ -286,6 +318,11 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		pair := pos.Pair()
 		m.trigger.Register(pair, pos.ID, evt.LevelIndex, level.Type, pos.Direction, level.TriggerPrice)
 
+		m.metrics.incExecutionFailed()
+		if ci.CircuitBreaker != nil {
+			ci.CircuitBreaker.RecordFailure()
+		}
+
 		m.emitError(ErrorEvent{
 			PositionID: evt.PositionID,
 			LevelIndex: evt.LevelIndex,
@@ -294,6 +331,15 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 			Retryable:  true,
 		})
 		return
+	}
+
+	m.metrics.incExecutionOK()
+	if ci.CircuitBreaker != nil {
+		ci.CircuitBreaker.RecordSuccess()
+	}
+	m.metrics.recordLatency(time.Since(execStart))
+	if receipt.GasUsed > 0 {
+		m.metrics.recordGas(pos.ChainID, receipt.GasUsed)
 	}
 
 	// Parse actual amountOut from receipt logs.
@@ -360,6 +406,10 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 	// Persist.
 	if err := m.cfg.Store.Update(ctx, pos); err != nil {
 		m.emitError(ErrorEvent{PositionID: pos.ID, ChainID: pos.ChainID, Err: fmt.Errorf("store update: %w", err)})
+	}
+	if pos.State == StateClosed {
+		m.metrics.incPositionsClosed()
+		m.posLocks.Remove(pos.ID)
 	}
 
 	m.log.Info("level executed",
@@ -478,6 +528,7 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 	}
 
 	m.registerPositionTriggers(pos)
+	m.metrics.incPositionsOpened()
 	return pos, nil
 }
 
@@ -506,7 +557,12 @@ func (m *Manager) CancelPosition(ctx context.Context, id [16]byte) error {
 	m.cancelActiveLevels(pos, pair, -1)
 	pos.State = StateCancelled
 	pos.UpdatedAt = time.Now().Unix()
-	return m.cfg.Store.Update(ctx, pos)
+	if err := m.cfg.Store.Update(ctx, pos); err != nil {
+		return err
+	}
+	m.metrics.incPositionsCancelled()
+	m.posLocks.Remove(id)
+	return nil
 }
 
 // UpdateLevel changes the trigger price of a level. Zero gas — off-chain only.
@@ -648,6 +704,7 @@ func (m *Manager) registerPositionTriggers(pos *Position) {
 	for _, level := range pos.Levels {
 		if level.Status == LevelActive {
 			m.trigger.Register(pair, pos.ID, level.Index, level.Type, pos.Direction, level.TriggerPrice)
+			m.metrics.incTriggersRegistered()
 		}
 	}
 }
