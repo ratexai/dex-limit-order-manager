@@ -708,19 +708,37 @@ var Configs = map[uint64]ChainConfig{
 - [ ] Deploy SwapExecutor на Sepolia + Base Sepolia
 - [ ] E2E тест с mock dependencies
 
+### Phase 1.5: Permit2 Hybrid Trading (реализовано)
+
+> Добавлено поверх Phase 1. Все пункты ниже реализованы в коммите `6e3946e`.
+
+- [x] `contracts/SwapExecutorV2.sol` — Permit2 AllowanceTransfer + SignatureTransfer + native ETH wrap
+- [x] `pkg/positionmanager/permit.go` — EIP-712 typed data builder, ecrecover, ValidatePermitForPosition
+- [x] `pkg/positionmanager/permit2_abi.go` — Permit2 + SwapExecutorV2 ABI bindings
+- [x] `pkg/positionmanager/types.go` — PermitSignature/Nonce/Deadline/Amount/Token/Activated на Position, SignedApproveTx + NativeETH на params
+- [x] `pkg/positionmanager/config.go` — BSCDefaults() (PancakeSwap V3), Permit2Address/MinPermitLifetime/PermitExpiryWarning
+- [x] `pkg/positionmanager/executor.go` — 3 execution modes (Legacy/Permit2Allowance/Permit2Signature), activatePermit(), broadcastSignedApproveTx()
+- [x] `pkg/positionmanager/manager.go` — permit validation в OpenPosition, activation в executeTrigger, runPermitExpiryMonitor(), RenewPermit(), suspendPositionLevels()
+- [x] `pkg/positionmanager/events.go` — PermitExpiryEvent
+- [x] `pkg/positionmanager/permit_test.go` — 13 тестов EIP-712 + validation
+- [x] Сети: Ethereum (Uniswap V3), BSC (PancakeSwap V3), Base (Uniswap V3)
+- [x] One-click UX: SignedApproveTx для silent approve + permit signing
+
 ### Phase 2: Production (3 недели)
 - [ ] TWAP validation в trigger engine (anti-manipulation)
 - [ ] Flashbots integration в executor (Ethereum)
 - [ ] Balance/allowance monitoring (periodic check в Run loop)
 - [ ] Circuit breaker (price deviation detection)
 - [ ] Market order support (`MarketSwap`)
-- [ ] Deploy SwapExecutor на Ethereum mainnet + Base mainnet
+- [ ] Deploy SwapExecutorV2 на Ethereum mainnet + BSC mainnet + Base mainnet
+- [ ] Foundry fork-тесты SwapExecutorV2 с real Permit2
 
 ### Phase 3: Scale (2-3 недели)
 - [ ] Multiple keeper EOAs (round-robin для burst SL execution)
 - [ ] Trailing stop-loss support
 - [ ] Performance тесты (50K positions)
 - [ ] Graceful shutdown, state recovery on restart
+- [ ] Uniswap V4 support (SwapExecutorV4 с IUnlockCallback)
 
 ---
 

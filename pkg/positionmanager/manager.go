@@ -22,6 +22,13 @@ type Manager struct {
 	trigger   *TriggerEngine
 	executors map[uint64]*executor // chainID → executor
 	posLocks  positionLockMap      // Per-position mutex to serialize executions.
+
+	// Dynamic pair subscription state (populated by Run, used by OpenPosition).
+	runCtx     context.Context    // Set when Run starts; nil before.
+	pairSubsMu sync.Mutex
+	pairSubs   map[uint64]map[TokenPair]bool       // chainID → set of subscribed pairs.
+	execChs    map[uint64]chan TriggerEvent          // chainID → execution channel.
+	subWg      map[uint64]*sync.WaitGroup            // chainID → WaitGroup for subscription goroutines.
 }
 
 // positionLockMap provides per-position mutual exclusion so that concurrent
@@ -123,6 +130,11 @@ func New(cfg Config) (*Manager, error) {
 // Run starts the keeper loop. It blocks until ctx is cancelled.
 // It loads active positions, subscribes to price feeds, and dispatches triggers.
 func (m *Manager) Run(ctx context.Context) error {
+	m.runCtx = ctx
+	m.pairSubs = make(map[uint64]map[TokenPair]bool)
+	m.execChs = make(map[uint64]chan TriggerEvent)
+	m.subWg = make(map[uint64]*sync.WaitGroup)
+
 	// Load active positions, register triggers, and collect pairs per chain.
 	chainPairs := make(map[uint64][]TokenPair)
 	for chainID := range m.cfg.Chains {
@@ -134,6 +146,12 @@ func (m *Manager) Run(ctx context.Context) error {
 			m.registerPositionTriggers(pos)
 		}
 		chainPairs[chainID] = uniquePairs(positions, chainID)
+
+		// Initialize per-chain subscription tracking.
+		m.pairSubs[chainID] = make(map[TokenPair]bool)
+		for _, pair := range chainPairs[chainID] {
+			m.pairSubs[chainID][pair] = true
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -167,6 +185,13 @@ func (m *Manager) runChain(ctx context.Context, chainID uint64, ci ChainInstance
 	// Buffered channel for trigger events awaiting execution.
 	execCh := make(chan TriggerEvent, workers*4)
 
+	// Store references for dynamic pair subscription from OpenPosition.
+	var subWg sync.WaitGroup
+	m.pairSubsMu.Lock()
+	m.execChs[chainID] = execCh
+	m.subWg[chainID] = &subWg
+	m.pairSubsMu.Unlock()
+
 	var wg sync.WaitGroup
 
 	// Start execution workers.
@@ -188,34 +213,79 @@ func (m *Manager) runChain(ctx context.Context, chainID uint64, ci ChainInstance
 		}()
 	}
 
-	// Subscribe to each pair's price feed.
+	// Subscribe to initial pairs.
 	for _, pair := range pairs {
-		ch, err := m.cfg.PriceFeed.Subscribe(ctx, pair)
-		if err != nil {
-			m.emitError(ErrorEvent{ChainID: chainID, Err: fmt.Errorf("subscribe %v: %w", pair, err)})
-			continue
-		}
-
-		wg.Add(1)
-		go func(pair TokenPair, ch <-chan PriceUpdate) {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case update, ok := <-ch:
-					if !ok {
-						return
-					}
-					m.handlePriceUpdate(ctx, update, execCh)
-				}
-			}
-		}(pair, ch)
+		m.subscribePair(ctx, chainID, pair, execCh, &subWg)
 	}
 
 	// Wait for all goroutines to finish.
 	wg.Wait()
+	subWg.Wait()
 	close(execCh)
+}
+
+// subscribePair subscribes to a price feed for a pair and routes updates to execCh.
+func (m *Manager) subscribePair(ctx context.Context, chainID uint64, pair TokenPair, execCh chan<- TriggerEvent, wg *sync.WaitGroup) {
+	ch, err := m.cfg.PriceFeed.Subscribe(ctx, pair)
+	if err != nil {
+		m.emitError(ErrorEvent{ChainID: chainID, Err: fmt.Errorf("subscribe %v: %w", pair, err)})
+		return
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case update, ok := <-ch:
+				if !ok {
+					return
+				}
+				m.handlePriceUpdate(ctx, update, execCh)
+			}
+		}
+	}()
+}
+
+// ensurePairSubscribed checks if a pair is already subscribed on a chain.
+// If not, subscribes dynamically. Safe to call from OpenPosition after Run has started.
+func (m *Manager) ensurePairSubscribed(chainID uint64, pair TokenPair) {
+	m.pairSubsMu.Lock()
+	defer m.pairSubsMu.Unlock()
+
+	// Run hasn't started yet — triggers will be picked up when Run initializes.
+	if m.pairSubs == nil {
+		return
+	}
+
+	subs, ok := m.pairSubs[chainID]
+	if !ok {
+		return // Unknown chain.
+	}
+	if subs[pair] {
+		return // Already subscribed.
+	}
+
+	execCh := m.execChs[chainID]
+	wg := m.subWg[chainID]
+	if execCh == nil || wg == nil {
+		return // Chain not initialized yet.
+	}
+
+	// Mark subscribed before releasing lock to prevent race with another OpenPosition.
+	subs[pair] = true
+
+	m.log.Info("dynamic pair subscription",
+		"chain", chainID,
+		"base", pair.Base.Hex(),
+		"quote", pair.Quote.Hex(),
+	)
+
+	// Subscribe outside the lock would be cleaner, but the PriceFeed.Subscribe
+	// call should be fast. The goroutine is spawned inside subscribePair.
+	m.subscribePair(m.runCtx, chainID, pair, execCh, wg)
 }
 
 // handlePriceUpdate processes a single price update by dispatching
@@ -432,7 +502,7 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		actualAmountOut = minAmountOut // Fallback if event parsing fails.
 	}
 
-	// Update level execution results.
+	// Build new state in memory (but do NOT touch trigger engine yet).
 	now := time.Now().Unix()
 	level.Status = LevelTriggered
 	level.ExecTxHash = txHash
@@ -440,39 +510,50 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 	level.ExecAmount = amountIn
 	level.ExecAt = now
 
-	// Update remaining size.
 	pos.RemainingSize = new(big.Int).Sub(pos.RemainingSize, amountIn)
 	if pos.RemainingSize.Sign() <= 0 {
 		pos.RemainingSize = new(big.Int)
 	}
 	pos.UpdatedAt = now
 
-	// Handle post-trigger actions.
+	// Compute new position state and which levels to cancel.
 	pair := pos.Pair()
+	var levelsToCancelInTrigger []int // Indices to unregister from trigger engine AFTER persist.
+	var slToMove *struct {            // SL price update to apply AFTER persist.
+		index     int
+		levelType LevelType
+		newPrice  *big.Int
+	}
 
-	// Cancel linked levels.
 	if level.Type == LevelTypeSL {
-		m.cancelActiveLevels(pos, pair, evt.LevelIndex)
+		// SL fired → cancel all other active levels, close position.
+		for i := range pos.Levels {
+			if i != evt.LevelIndex && pos.Levels[i].Status == LevelActive {
+				pos.Levels[i].Status = LevelCancelled
+				levelsToCancelInTrigger = append(levelsToCancelInTrigger, i)
+			}
+		}
 		pos.State = StateClosed
 	} else {
 		// TP fired.
-		// Cancel specified levels.
 		for _, cancelIdx := range level.CancelOnFire {
 			if cancelIdx < len(pos.Levels) && pos.Levels[cancelIdx].Status == LevelActive {
 				pos.Levels[cancelIdx].Status = LevelCancelled
-				m.trigger.Unregister(pair, pos.ID, cancelIdx)
+				levelsToCancelInTrigger = append(levelsToCancelInTrigger, cancelIdx)
 			}
 		}
 
-		// Move SL if configured.
 		if level.MoveSLTo != nil && level.MoveSLTo.Sign() > 0 {
 			if sl := pos.ActiveSL(); sl != nil {
 				sl.TriggerPrice = new(big.Int).Set(level.MoveSLTo)
-				m.trigger.UpdateTriggerPrice(pair, pos.ID, sl.Index, sl.Type, pos.Direction, sl.TriggerPrice)
+				slToMove = &struct {
+					index     int
+					levelType LevelType
+					newPrice  *big.Int
+				}{sl.Index, sl.Type, new(big.Int).Set(level.MoveSLTo)}
 			}
 		}
 
-		// Check if position is fully closed.
 		hasActive := false
 		for _, l := range pos.Levels {
 			if l.Status == LevelActive {
@@ -487,10 +568,27 @@ func (m *Manager) executeTrigger(ctx context.Context, evt TriggerEvent) {
 		}
 	}
 
-	// Persist.
-	if err := m.cfg.Store.Update(ctx, pos); err != nil {
+	// Persist BEFORE modifying trigger engine. Retry on failure because the
+	// on-chain swap already happened and the state MUST be recorded.
+	if err := m.storeUpdateWithRetry(ctx, pos, 3); err != nil {
 		m.metrics.IncErrorTotal(pos.ChainID, "store_update")
-		m.emitError(ErrorEvent{PositionID: pos.ID, ChainID: pos.ChainID, Err: fmt.Errorf("store update: %w", err)})
+		m.log.Error("CRITICAL: store update failed after on-chain swap — manual intervention may be needed",
+			"position", fmt.Sprintf("%x", pos.ID[:8]),
+			"tx", txHash.Hex(),
+			"error", err,
+		)
+		m.emitError(ErrorEvent{PositionID: pos.ID, ChainID: pos.ChainID, Err: fmt.Errorf("store update after swap: %w", err)})
+		// Do NOT update trigger engine — next Run restart will re-load from DB
+		// and the swap will fail on-chain (tokens already moved), which is safe.
+		return
+	}
+
+	// Persist succeeded — now safe to update in-memory trigger engine.
+	for _, idx := range levelsToCancelInTrigger {
+		m.trigger.Unregister(pair, pos.ID, idx)
+	}
+	if slToMove != nil {
+		m.trigger.UpdateTriggerPrice(pair, pos.ID, slToMove.index, slToMove.levelType, pos.Direction, slToMove.newPrice)
 	}
 
 	m.log.Info("level executed",
@@ -672,6 +770,10 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 	}
 
 	m.registerPositionTriggers(pos)
+
+	// Subscribe to the pair's price feed if not already subscribed (dynamic subscription).
+	m.ensurePairSubscribed(pos.ChainID, pos.Pair())
+
 	return pos, nil
 }
 
@@ -1066,6 +1168,33 @@ func (m *Manager) checkPermitExpiry(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// storeUpdateWithRetry attempts Store.Update up to maxRetries times with exponential backoff.
+// Used after on-chain swaps where the state MUST be persisted.
+func (m *Manager) storeUpdateWithRetry(ctx context.Context, pos *Position, maxRetries int) error {
+	var err error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		err = m.cfg.Store.Update(ctx, pos)
+		if err == nil {
+			return nil
+		}
+		if attempt < maxRetries {
+			backoff := time.Duration(1<<uint(attempt)) * time.Second // 1s, 2s, 4s
+			m.log.Warn("store update failed, retrying",
+				"position", fmt.Sprintf("%x", pos.ID[:8]),
+				"attempt", attempt+1,
+				"backoff", backoff,
+				"error", err,
+			)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return err
 }
 
 func (m *Manager) emitError(evt ErrorEvent) {

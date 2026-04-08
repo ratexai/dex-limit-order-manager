@@ -3,6 +3,7 @@ package positionmanager
 import (
 	"context"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -875,5 +876,460 @@ func TestComputeAmount_Full(t *testing.T) {
 	amount := h.manager.computeAmount(pos, level)
 	if amount.Cmp(big.NewInt(10000)) != 0 {
 		t.Errorf("expected 10000, got %s", amount)
+	}
+}
+
+// --- Dynamic pair subscription tests (Bug fix #1) ---
+
+func TestOpenPosition_SubscribesNewPairDynamically(t *testing.T) {
+	h := newTestHarness(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start Run in background — it will subscribe to pairs from existing positions (none).
+	runDone := make(chan error, 1)
+	go func() { runDone <- h.manager.Run(ctx) }()
+
+	// Give Run time to initialize.
+	time.Sleep(50 * time.Millisecond)
+
+	// Open a position with a new pair — should trigger dynamic subscription.
+	params := testOpenParams()
+	pos, err := h.manager.OpenPosition(ctx, params)
+	if err != nil {
+		t.Fatalf("OpenPosition: %v", err)
+	}
+
+	// Verify the pair is now tracked as subscribed.
+	h.manager.pairSubsMu.Lock()
+	subscribed := h.manager.pairSubs[pos.ChainID][pos.Pair()]
+	h.manager.pairSubsMu.Unlock()
+
+	if !subscribed {
+		t.Error("new pair should be subscribed after OpenPosition")
+	}
+
+	// Push a price update for the new pair — triggers should fire.
+	pair := pos.Pair()
+	h.priceFeed.pushPrice(pair, big.NewInt(170000000000)) // Below SL at $1800
+
+	// Give the trigger time to process.
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	<-runDone
+}
+
+// --- Store update retry tests (Bug fix #2) ---
+
+type failNStore struct {
+	*mockStore
+	failCount int
+	mu        sync.Mutex
+	attempts  int
+}
+
+func (s *failNStore) Update(ctx context.Context, pos *Position) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts++
+	if s.attempts <= s.failCount {
+		return fmt.Errorf("simulated store failure (attempt %d)", s.attempts)
+	}
+	return s.mockStore.Update(ctx, pos)
+}
+
+func TestStoreUpdateWithRetry_SucceedsOnRetry(t *testing.T) {
+	store := newMockStore()
+	pf := newMockPriceFeed()
+	cc := newMockChainClient()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := New(Config{
+		Store:       store,
+		PriceFeed:   pf,
+		FeeProvider: &mockFeeProvider{fee: &FeeConfig{FeeBps: 100}},
+		Chains: map[uint64]ChainInstance{
+			1: {
+				Client:          cc,
+				KeeperKey:       key,
+				ExecutorAddress: common.HexToAddress("0x1234"),
+				ChainConfig:     EthereumDefaults(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a position to test retry with.
+	pos := &Position{
+		ID:            [16]byte{1, 2, 3},
+		State:         StateActive,
+		RemainingSize: big.NewInt(1e18),
+	}
+	store.Save(context.Background(), pos)
+
+	// Wrap the store with one that fails first 2 times then succeeds.
+	failStore := &failNStore{mockStore: store, failCount: 2}
+	mgr.cfg.Store = failStore
+
+	err = mgr.storeUpdateWithRetry(context.Background(), pos, 3)
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if failStore.attempts != 3 { // 2 failures + 1 success
+		t.Errorf("expected 3 attempts, got %d", failStore.attempts)
+	}
+}
+
+func TestStoreUpdateWithRetry_ExhaustsRetries(t *testing.T) {
+	store := newMockStore()
+	pf := newMockPriceFeed()
+	cc := newMockChainClient()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := New(Config{
+		Store:       store,
+		PriceFeed:   pf,
+		FeeProvider: &mockFeeProvider{fee: &FeeConfig{FeeBps: 100}},
+		Chains: map[uint64]ChainInstance{
+			1: {
+				Client:          cc,
+				KeeperKey:       key,
+				ExecutorAddress: common.HexToAddress("0x1234"),
+				ChainConfig:     EthereumDefaults(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pos := &Position{
+		ID:            [16]byte{4, 5, 6},
+		State:         StateActive,
+		RemainingSize: big.NewInt(1e18),
+	}
+	store.Save(context.Background(), pos)
+
+	// Always fails.
+	failStore := &failNStore{mockStore: store, failCount: 100}
+	mgr.cfg.Store = failStore
+
+	err = mgr.storeUpdateWithRetry(context.Background(), pos, 2)
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if failStore.attempts != 3 { // 0, 1, 2 = 3 total
+		t.Errorf("expected 3 attempts, got %d", failStore.attempts)
+	}
+}
+
+// --- Permit2 integration tests ---
+
+func TestOpenPosition_WithPermit(t *testing.T) {
+	h := newTestHarness(t)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executorAddr := h.manager.cfg.Chains[1].ExecutorAddress
+	params := testOpenParamsWithPermit(t, key, executorAddr)
+
+	pos, err := h.manager.OpenPosition(context.Background(), params)
+	if err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+
+	// Verify permit data stored on position.
+	if len(pos.PermitSignature) != 65 {
+		t.Errorf("PermitSignature length = %d, want 65", len(pos.PermitSignature))
+	}
+	if pos.PermitDeadline == 0 {
+		t.Error("PermitDeadline should be set")
+	}
+	if pos.PermitAmount == nil || pos.PermitAmount.Cmp(params.Size) != 0 {
+		t.Errorf("PermitAmount = %v, want %v", pos.PermitAmount, params.Size)
+	}
+	if pos.PermitToken == (common.Address{}) {
+		t.Error("PermitToken should be set")
+	}
+	if pos.PermitActivated {
+		t.Error("PermitActivated should be false at creation")
+	}
+}
+
+func TestOpenPosition_WithExpiredPermit(t *testing.T) {
+	h := newTestHarness(t)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executorAddr := h.manager.cfg.Chains[1].ExecutorAddress
+	params := testOpenParamsWithExpiredPermit(t, key, executorAddr)
+
+	_, err = h.manager.OpenPosition(context.Background(), params)
+	if err == nil {
+		t.Fatal("expected error for expired permit")
+	}
+	if !strings.Contains(err.Error(), "expired") && !strings.Contains(err.Error(), "lifetime") {
+		t.Errorf("expected expiry-related error, got: %v", err)
+	}
+}
+
+func TestOpenPosition_WithInsufficientPermitAmount(t *testing.T) {
+	h := newTestHarness(t)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executorAddr := h.manager.cfg.Chains[1].ExecutorAddress
+	owner := crypto.PubkeyToAddress(key.PublicKey)
+	params := testOpenParams()
+	params.Owner = owner
+
+	// Sign permit for a smaller amount than the position size.
+	tokenIn := params.TokenBase
+	deadline := time.Now().Add(30 * 24 * time.Hour).Unix()
+	smallAmount := new(big.Int).Div(params.Size, big.NewInt(2)) // Half the size.
+
+	data := PermitSingleData{
+		Token:       tokenIn,
+		Amount:      smallAmount,
+		Expiration:  uint64(deadline),
+		Nonce:       0,
+		Spender:     executorAddr,
+		SigDeadline: new(big.Int).SetInt64(deadline),
+	}
+
+	permit2Addr := common.HexToAddress(Permit2CanonicalAddress)
+	hash := Permit2EIP712Hash(data, params.ChainID, permit2Addr)
+	sig, err := crypto.Sign(hash.Bytes(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig[64] += 27
+
+	params.PermitSignature = sig
+	params.PermitNonce = new(big.Int)
+	params.PermitDeadline = deadline
+
+	_, err = h.manager.OpenPosition(context.Background(), params)
+	if err == nil {
+		t.Fatal("expected error for insufficient permit amount")
+	}
+	if !strings.Contains(err.Error(), "amount") {
+		t.Errorf("expected amount-related error, got: %v", err)
+	}
+}
+
+func TestRenewPermit_Success(t *testing.T) {
+	h := newTestHarness(t)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executorAddr := h.manager.cfg.Chains[1].ExecutorAddress
+	params := testOpenParamsWithPermit(t, key, executorAddr)
+
+	pos, err := h.manager.OpenPosition(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Manually suspend levels (simulating expired permit).
+	for i := range pos.Levels {
+		pos.Levels[i].Status = LevelSuspended
+	}
+	h.store.Update(context.Background(), pos)
+
+	// Create new permit signature for renewal.
+	newDeadline := time.Now().Add(60 * 24 * time.Hour).Unix()
+	newData := PermitSingleData{
+		Token:       pos.PermitToken,
+		Amount:      pos.PermitAmount,
+		Expiration:  uint64(newDeadline),
+		Nonce:       1,
+		Spender:     executorAddr,
+		SigDeadline: new(big.Int).SetInt64(newDeadline),
+	}
+	permit2Addr := common.HexToAddress(Permit2CanonicalAddress)
+	hash := Permit2EIP712Hash(newData, pos.ChainID, permit2Addr)
+	newSig, err := crypto.Sign(hash.Bytes(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSig[64] += 27
+
+	err = h.manager.RenewPermit(context.Background(), pos.ID, newSig, big.NewInt(1), newDeadline, pos.PermitAmount)
+	if err != nil {
+		t.Fatalf("RenewPermit failed: %v", err)
+	}
+
+	// Reload and check.
+	renewed, _ := h.store.Get(context.Background(), pos.ID)
+	if renewed.PermitDeadline != newDeadline {
+		t.Errorf("deadline = %d, want %d", renewed.PermitDeadline, newDeadline)
+	}
+	if renewed.PermitActivated {
+		t.Error("PermitActivated should be reset to false after renewal")
+	}
+	for i, l := range renewed.Levels {
+		if l.Status != LevelActive {
+			t.Errorf("level %d status = %v, want Active", i, l.Status)
+		}
+	}
+}
+
+func TestRenewPermit_TerminalPosition(t *testing.T) {
+	h := newTestHarness(t)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executorAddr := h.manager.cfg.Chains[1].ExecutorAddress
+	params := testOpenParamsWithPermit(t, key, executorAddr)
+
+	pos, err := h.manager.OpenPosition(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Cancel the position.
+	h.manager.CancelPosition(context.Background(), pos.ID)
+
+	err = h.manager.RenewPermit(context.Background(), pos.ID, []byte("newsig"), big.NewInt(1), time.Now().Add(24*time.Hour).Unix(), pos.PermitAmount)
+	if err == nil {
+		t.Fatal("expected error for terminal position")
+	}
+}
+
+func TestExecuteTrigger_SuspendsOnExpiredPermit(t *testing.T) {
+	h := newTestHarness(t)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executorAddr := h.manager.cfg.Chains[1].ExecutorAddress
+	owner := crypto.PubkeyToAddress(key.PublicKey)
+
+	// Create position with permit that has a past deadline.
+	params := testOpenParams()
+	params.Owner = owner
+
+	// Don't use the validator — create position directly to simulate an expired-in-progress scenario.
+	pos, err := h.manager.OpenPosition(context.Background(), params) // Legacy mode (no permit).
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Manually set an expired permit on the position.
+	pos.PermitSignature = make([]byte, 65)
+	pos.PermitDeadline = time.Now().Add(-1 * time.Hour).Unix()
+	pos.PermitAmount = params.Size
+	pos.PermitToken = params.TokenBase
+	pos.PermitNonce = new(big.Int)
+	h.store.Update(context.Background(), pos)
+
+	// Fire a trigger event.
+	h.manager.executeTrigger(context.Background(), TriggerEvent{
+		PositionID: pos.ID,
+		LevelIndex: 0,
+		ChainID:    1,
+		Price:      big.NewInt(180000000000),
+	})
+
+	// Reload and verify levels are suspended.
+	updated, _ := h.store.Get(context.Background(), pos.ID)
+	for i, l := range updated.Levels {
+		if l.Status != LevelSuspended {
+			t.Errorf("level %d status = %v, want Suspended", i, l.Status)
+		}
+	}
+}
+
+func TestCheckPermitExpiry_EmitsEvent(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := crypto.PubkeyToAddress(key.PublicKey)
+
+	store := newMockStore()
+	pf := newMockPriceFeed()
+	cc := newMockChainClient()
+
+	var permitEvents []PermitExpiryEvent
+	var mu sync.Mutex
+
+	mgr, err := New(Config{
+		Store:       store,
+		PriceFeed:   pf,
+		FeeProvider: &mockFeeProvider{fee: &FeeConfig{FeeBps: 100}},
+		Chains: map[uint64]ChainInstance{
+			1: {
+				Client:          cc,
+				KeeperKey:       key,
+				ExecutorAddress: common.HexToAddress("0x1234"),
+				ChainConfig:     EthereumDefaults(),
+			},
+		},
+		OnPermitExpiring: func(evt PermitExpiryEvent) {
+			mu.Lock()
+			permitEvents = append(permitEvents, evt)
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a position with a permit expiring in 12 hours (within 48h warning window).
+	pos := &Position{
+		ID:              [16]byte{1, 2, 3, 4},
+		Owner:           owner,
+		State:           StateActive,
+		ChainID:         1,
+		TokenBase:       common.HexToAddress("0xBase"),
+		TokenQuote:      common.HexToAddress("0xQuote"),
+		PermitSignature: make([]byte, 65),
+		PermitDeadline:  time.Now().Add(12 * time.Hour).Unix(),
+		PermitAmount:    big.NewInt(1e18),
+		PermitToken:     common.HexToAddress("0xBase"),
+		Levels: []Level{
+			{Index: 0, Type: LevelTypeSL, Status: LevelActive, TriggerPrice: big.NewInt(180000000000), PortionBps: 10000},
+		},
+	}
+	store.Save(context.Background(), pos)
+
+	// Call the expiry check directly.
+	mgr.checkPermitExpiry(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(permitEvents) != 1 {
+		t.Fatalf("expected 1 permit expiry event, got %d", len(permitEvents))
+	}
+	if permitEvents[0].PositionID != pos.ID {
+		t.Error("wrong position ID in expiry event")
+	}
+	if permitEvents[0].ActiveLevels != 1 {
+		t.Errorf("expected 1 active level, got %d", permitEvents[0].ActiveLevels)
 	}
 }
