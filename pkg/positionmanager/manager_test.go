@@ -879,6 +879,162 @@ func TestComputeAmount_Full(t *testing.T) {
 	}
 }
 
+// --- Dynamic pair subscription tests (Bug fix #1) ---
+
+func TestOpenPosition_SubscribesNewPairDynamically(t *testing.T) {
+	h := newTestHarness(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start Run in background — it will subscribe to pairs from existing positions (none).
+	runDone := make(chan error, 1)
+	go func() { runDone <- h.manager.Run(ctx) }()
+
+	// Give Run time to initialize.
+	time.Sleep(50 * time.Millisecond)
+
+	// Open a position with a new pair — should trigger dynamic subscription.
+	params := testOpenParams()
+	pos, err := h.manager.OpenPosition(ctx, params)
+	if err != nil {
+		t.Fatalf("OpenPosition: %v", err)
+	}
+
+	// Verify the pair is now tracked as subscribed.
+	h.manager.pairSubsMu.Lock()
+	subscribed := h.manager.pairSubs[pos.ChainID][pos.Pair()]
+	h.manager.pairSubsMu.Unlock()
+
+	if !subscribed {
+		t.Error("new pair should be subscribed after OpenPosition")
+	}
+
+	// Push a price update for the new pair — triggers should fire.
+	pair := pos.Pair()
+	h.priceFeed.pushPrice(pair, big.NewInt(170000000000)) // Below SL at $1800
+
+	// Give the trigger time to process.
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	<-runDone
+}
+
+// --- Store update retry tests (Bug fix #2) ---
+
+type failNStore struct {
+	*mockStore
+	failCount int
+	mu        sync.Mutex
+	attempts  int
+}
+
+func (s *failNStore) Update(ctx context.Context, pos *Position) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts++
+	if s.attempts <= s.failCount {
+		return fmt.Errorf("simulated store failure (attempt %d)", s.attempts)
+	}
+	return s.mockStore.Update(ctx, pos)
+}
+
+func TestStoreUpdateWithRetry_SucceedsOnRetry(t *testing.T) {
+	store := newMockStore()
+	pf := newMockPriceFeed()
+	cc := newMockChainClient()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := New(Config{
+		Store:       store,
+		PriceFeed:   pf,
+		FeeProvider: &mockFeeProvider{fee: &FeeConfig{FeeBps: 100}},
+		Chains: map[uint64]ChainInstance{
+			1: {
+				Client:          cc,
+				KeeperKey:       key,
+				ExecutorAddress: common.HexToAddress("0x1234"),
+				ChainConfig:     EthereumDefaults(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a position to test retry with.
+	pos := &Position{
+		ID:            [16]byte{1, 2, 3},
+		State:         StateActive,
+		RemainingSize: big.NewInt(1e18),
+	}
+	store.Save(context.Background(), pos)
+
+	// Wrap the store with one that fails first 2 times then succeeds.
+	failStore := &failNStore{mockStore: store, failCount: 2}
+	mgr.cfg.Store = failStore
+
+	err = mgr.storeUpdateWithRetry(context.Background(), pos, 3)
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if failStore.attempts != 3 { // 2 failures + 1 success
+		t.Errorf("expected 3 attempts, got %d", failStore.attempts)
+	}
+}
+
+func TestStoreUpdateWithRetry_ExhaustsRetries(t *testing.T) {
+	store := newMockStore()
+	pf := newMockPriceFeed()
+	cc := newMockChainClient()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := New(Config{
+		Store:       store,
+		PriceFeed:   pf,
+		FeeProvider: &mockFeeProvider{fee: &FeeConfig{FeeBps: 100}},
+		Chains: map[uint64]ChainInstance{
+			1: {
+				Client:          cc,
+				KeeperKey:       key,
+				ExecutorAddress: common.HexToAddress("0x1234"),
+				ChainConfig:     EthereumDefaults(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pos := &Position{
+		ID:            [16]byte{4, 5, 6},
+		State:         StateActive,
+		RemainingSize: big.NewInt(1e18),
+	}
+	store.Save(context.Background(), pos)
+
+	// Always fails.
+	failStore := &failNStore{mockStore: store, failCount: 100}
+	mgr.cfg.Store = failStore
+
+	err = mgr.storeUpdateWithRetry(context.Background(), pos, 2)
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if failStore.attempts != 3 { // 0, 1, 2 = 3 total
+		t.Errorf("expected 3 attempts, got %d", failStore.attempts)
+	}
+}
+
 // --- Permit2 integration tests ---
 
 func TestOpenPosition_WithPermit(t *testing.T) {
