@@ -139,6 +139,17 @@ func ValidatePermitForPosition(
 	signature []byte,
 	minLifetime time.Duration,
 ) error {
+	// 0. Nil safety — prevent panics from uninitialized big.Int fields.
+	if size == nil || size.Sign() <= 0 {
+		return fmt.Errorf("position size is nil or zero")
+	}
+	if permitData.Amount == nil {
+		return fmt.Errorf("permit amount is nil")
+	}
+	if permitData.SigDeadline == nil {
+		return fmt.Errorf("permit sigDeadline is nil")
+	}
+
 	// 1. Recover signer and verify it matches the owner.
 	signer, err := RecoverPermitSigner(permitData, chainID, permit2Address, signature)
 	if err != nil {

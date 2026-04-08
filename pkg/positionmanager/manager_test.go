@@ -1175,7 +1175,7 @@ func TestRenewPermit_Success(t *testing.T) {
 	}
 	newSig[64] += 27
 
-	err = h.manager.RenewPermit(context.Background(), pos.ID, newSig, big.NewInt(1), newDeadline, pos.PermitAmount)
+	err = h.manager.RenewPermit(context.Background(), pos.ID, pos.Owner, newSig, big.NewInt(1), newDeadline, pos.PermitAmount)
 	if err != nil {
 		t.Fatalf("RenewPermit failed: %v", err)
 	}
@@ -1213,7 +1213,7 @@ func TestRenewPermit_TerminalPosition(t *testing.T) {
 	// Cancel the position.
 	h.manager.CancelPosition(context.Background(), pos.ID)
 
-	err = h.manager.RenewPermit(context.Background(), pos.ID, []byte("newsig"), big.NewInt(1), time.Now().Add(24*time.Hour).Unix(), pos.PermitAmount)
+	err = h.manager.RenewPermit(context.Background(), pos.ID, pos.Owner, []byte("newsig"), big.NewInt(1), time.Now().Add(24*time.Hour).Unix(), pos.PermitAmount)
 	if err == nil {
 		t.Fatal("expected error for terminal position")
 	}

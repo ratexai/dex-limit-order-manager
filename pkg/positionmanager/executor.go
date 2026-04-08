@@ -442,10 +442,43 @@ func (e *executor) activatePermit(ctx context.Context, params activatePermitPara
 // broadcastSignedApproveTx broadcasts a user-signed approve TX (for one-click flow).
 // The frontend silently signs token.approve(Permit2, MAX) and sends the signed TX bytes.
 // Keeper broadcasts it and waits for confirmation before proceeding with the swap.
+//
+// Security: validates that the TX calldata is an ERC20 approve() call (selector 0x095ea7b3)
+// targeting the Permit2 canonical address. Rejects any other function or spender.
 func (e *executor) broadcastSignedApproveTx(ctx context.Context, signedTxBytes []byte) (common.Hash, error) {
 	tx := new(types.Transaction)
 	if err := tx.UnmarshalBinary(signedTxBytes); err != nil {
 		return common.Hash{}, fmt.Errorf("decode signed approve tx: %w", err)
+	}
+
+	// Validate: must be a call (not a contract creation).
+	if tx.To() == nil {
+		return common.Hash{}, fmt.Errorf("approve tx has no 'to' address (contract creation not allowed)")
+	}
+
+	// Validate: calldata must be an ERC20 approve(address spender, uint256 amount) call.
+	// Function selector: 0x095ea7b3
+	data := tx.Data()
+	if len(data) < 4+32+32 { // 4-byte selector + address + uint256
+		return common.Hash{}, fmt.Errorf("approve tx calldata too short (%d bytes)", len(data))
+	}
+	approveSelector := [4]byte{0x09, 0x5e, 0xa7, 0xb3}
+	if data[0] != approveSelector[0] || data[1] != approveSelector[1] ||
+		data[2] != approveSelector[2] || data[3] != approveSelector[3] {
+		return common.Hash{}, fmt.Errorf("approve tx has wrong function selector (expected approve)")
+	}
+
+	// Validate: spender must be Permit2 canonical address.
+	// The spender is the first argument (bytes 4-36, right-padded address at bytes 16-36).
+	spender := common.BytesToAddress(data[4:36])
+	permit2Addr := common.HexToAddress(Permit2CanonicalAddress)
+	if spender != permit2Addr {
+		return common.Hash{}, fmt.Errorf("approve tx spender is %s, expected Permit2 %s", spender.Hex(), permit2Addr.Hex())
+	}
+
+	// Validate: TX must not send ETH value.
+	if tx.Value() != nil && tx.Value().Sign() > 0 {
+		return common.Hash{}, fmt.Errorf("approve tx must not send ETH value")
 	}
 
 	if err := e.client.SendTransaction(ctx, tx); err != nil {
