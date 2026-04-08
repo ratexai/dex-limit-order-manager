@@ -3,6 +3,8 @@ package positionmanager
 import (
 	"math/big"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 func TestComputeMinAmountOut_ETH_USDC(t *testing.T) {
@@ -201,5 +203,106 @@ func TestApplyGasBuffer(t *testing.T) {
 	tp := exec.applyGasBuffer(200000, PriorityNormal)
 	if tp != 240000 {
 		t.Errorf("TP gas buffer: expected 240000, got %d", tp)
+	}
+}
+
+// --- packSwapCalldata tests ---
+
+func testSwapParams() executeSwapParams {
+	return executeSwapParams{
+		User:         common.HexToAddress("0xUser"),
+		TokenIn:      common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+		TokenOut:     common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+		PoolFee:      3000,
+		AmountIn:     big.NewInt(1e18),
+		MinAmountOut: big.NewInt(1990_000000),
+		FeeBps:       100,
+		Priority:     PriorityNormal,
+	}
+}
+
+func TestPackSwapCalldata_LegacyMode(t *testing.T) {
+	exec := &executor{cfg: EthereumDefaults()}
+	params := testSwapParams()
+	params.Mode = ExecModeLegacy
+
+	data, err := exec.packSwapCalldata(params)
+	if err != nil {
+		t.Fatalf("pack calldata: %v", err)
+	}
+
+	// Verify we got non-empty calldata.
+	if len(data) < 4 {
+		t.Fatal("calldata too short")
+	}
+
+	// First 4 bytes should be the executeSwap function selector.
+	method, err := parsedSwapExecutorABI.MethodById(data[:4])
+	if err != nil {
+		t.Fatalf("method lookup: %v", err)
+	}
+	if method.Name != "executeSwap" {
+		t.Errorf("method = %s, want executeSwap", method.Name)
+	}
+}
+
+func TestPackSwapCalldata_Permit2AllowanceMode(t *testing.T) {
+	exec := &executor{cfg: EthereumDefaults()}
+	params := testSwapParams()
+	params.Mode = ExecModePermit2Allowance
+
+	data, err := exec.packSwapCalldata(params)
+	if err != nil {
+		t.Fatalf("pack calldata: %v", err)
+	}
+
+	if len(data) < 4 {
+		t.Fatal("calldata too short")
+	}
+
+	method, err := parsedSwapExecutorV2ABI.MethodById(data[:4])
+	if err != nil {
+		t.Fatalf("method lookup: %v", err)
+	}
+	if method.Name != "executeSwapViaPermit2" {
+		t.Errorf("method = %s, want executeSwapViaPermit2", method.Name)
+	}
+}
+
+func TestPackSwapCalldata_Permit2SignatureMode(t *testing.T) {
+	exec := &executor{cfg: EthereumDefaults()}
+	params := testSwapParams()
+	params.Mode = ExecModePermit2Signature
+	params.PermitNonce = big.NewInt(0)
+	params.PermitDeadline = big.NewInt(1714521600)
+	params.PermitSignature = make([]byte, 65)
+
+	data, err := exec.packSwapCalldata(params)
+	if err != nil {
+		t.Fatalf("pack calldata: %v", err)
+	}
+
+	if len(data) < 4 {
+		t.Fatal("calldata too short")
+	}
+
+	method, err := parsedSwapExecutorV2ABI.MethodById(data[:4])
+	if err != nil {
+		t.Fatalf("method lookup: %v", err)
+	}
+	if method.Name != "executeSwapWithSignature" {
+		t.Errorf("method = %s, want executeSwapWithSignature", method.Name)
+	}
+}
+
+func TestBroadcastSignedApproveTx_InvalidRLP(t *testing.T) {
+	exec := &executor{
+		client: newMockChainClient(),
+		cfg:    EthereumDefaults(),
+	}
+
+	_, err := exec.broadcastSignedApproveTx(nil, []byte{0xDE, 0xAD})
+	if err == nil {
+		t.Fatal("expected error for invalid RLP")
 	}
 }

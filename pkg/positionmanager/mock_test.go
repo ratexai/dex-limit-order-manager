@@ -2,13 +2,17 @@ package positionmanager
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"math/big"
 	"sync"
+	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // --- Mock Store ---
@@ -211,4 +215,75 @@ func (c *mockChainClient) TransactionReceipt(_ context.Context, txHash common.Ha
 		return nil, fmt.Errorf("receipt not found")
 	}
 	return r, nil
+}
+
+// --- Permit2 test helpers ---
+
+// testOpenParamsWithPermit creates OpenParams with a valid Permit2 signature.
+// Uses the provided key to sign a PermitSingle for the given executor address.
+func testOpenParamsWithPermit(t *testing.T, userKey *ecdsa.PrivateKey, executorAddr common.Address) OpenParams {
+	t.Helper()
+	params := testOpenParams()
+	params.Owner = crypto.PubkeyToAddress(userKey.PublicKey)
+
+	// Determine tokenIn based on direction (Long → base token).
+	tokenIn := params.TokenBase
+
+	deadline := time.Now().Add(30 * 24 * time.Hour).Unix()
+	nonce := uint64(0)
+
+	data := PermitSingleData{
+		Token:       tokenIn,
+		Amount:      params.Size,
+		Expiration:  uint64(deadline),
+		Nonce:       nonce,
+		Spender:     executorAddr,
+		SigDeadline: new(big.Int).SetInt64(deadline),
+	}
+
+	permit2Addr := common.HexToAddress(Permit2CanonicalAddress)
+	hash := Permit2EIP712Hash(data, params.ChainID, permit2Addr)
+	sig, err := crypto.Sign(hash.Bytes(), userKey)
+	if err != nil {
+		t.Fatalf("sign permit: %v", err)
+	}
+	sig[64] += 27 // Ethereum v convention.
+
+	params.PermitSignature = sig
+	params.PermitNonce = new(big.Int).SetUint64(nonce)
+	params.PermitDeadline = deadline
+	return params
+}
+
+// testOpenParamsWithExpiredPermit creates OpenParams with a permit that already expired.
+func testOpenParamsWithExpiredPermit(t *testing.T, userKey *ecdsa.PrivateKey, executorAddr common.Address) OpenParams {
+	t.Helper()
+	params := testOpenParams()
+	params.Owner = crypto.PubkeyToAddress(userKey.PublicKey)
+
+	tokenIn := params.TokenBase
+	deadline := time.Now().Add(-1 * time.Hour).Unix() // Already expired.
+	nonce := uint64(0)
+
+	data := PermitSingleData{
+		Token:       tokenIn,
+		Amount:      params.Size,
+		Expiration:  uint64(deadline),
+		Nonce:       nonce,
+		Spender:     executorAddr,
+		SigDeadline: new(big.Int).SetInt64(deadline),
+	}
+
+	permit2Addr := common.HexToAddress(Permit2CanonicalAddress)
+	hash := Permit2EIP712Hash(data, params.ChainID, permit2Addr)
+	sig, err := crypto.Sign(hash.Bytes(), userKey)
+	if err != nil {
+		t.Fatalf("sign permit: %v", err)
+	}
+	sig[64] += 27
+
+	params.PermitSignature = sig
+	params.PermitNonce = new(big.Int).SetUint64(nonce)
+	params.PermitDeadline = deadline
+	return params
 }
