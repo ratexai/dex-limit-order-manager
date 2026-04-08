@@ -26,20 +26,20 @@ type WebSocketClient interface {
 
 // OKXConfig configures the OKX DEX ticker API for price cross-checking.
 type OKXConfig struct {
-	BaseURL     string        // e.g. "https://www.okx.com" (default)
-	ChainIndex  string        // OKX chain index: "1" (ETH), "56" (BSC), "8453" (Base)
-	Timeout     time.Duration // HTTP timeout (default 5s)
+	BaseURL      string        // e.g. "https://www.okx.com" (default)
+	ChainIndex   string        // OKX chain index: "1" (ETH), "56" (BSC), "8453" (Base)
+	Timeout      time.Duration // HTTP timeout (default 5s)
 	PollInterval time.Duration // How often to poll OKX (default 10s)
 }
 
 // DualPriceFeedConfig configures the dual-source price feed.
 type DualPriceFeedConfig struct {
-	WSClient       WebSocketClient       // WebSocket-capable chain client
-	Pools          []UniswapV3PoolDef    // Uniswap/PancakeSwap V3 pools to track
-	OKX            *OKXConfig            // OKX config (nil = no OKX fallback)
-	TWAPSeconds    uint32                // TWAP window for initial price read (0 = spot)
-	MaxDeviation   uint16                // Max bps deviation between sources before alert (default 200 = 2%)
-	StaleThreshold time.Duration         // Price considered stale after this (default 30s)
+	WSClients      map[uint64]WebSocketClient // WebSocket-capable chain client
+	Pools          []UniswapV3PoolDef         // Uniswap/PancakeSwap V3 pools to track
+	OKX            *OKXConfig                 // OKX config (nil = no OKX fallback)
+	TWAPSeconds    uint32                     // TWAP window for initial price read (0 = spot)
+	MaxDeviation   uint16                     // Max bps deviation between sources before alert (default 200 = 2%)
+	StaleThreshold time.Duration              // Price considered stale after this (default 30s)
 }
 
 // DualPriceFeed implements PriceFeed using Uniswap V3 Swap events (primary)
@@ -54,13 +54,13 @@ type DualPriceFeedConfig struct {
 //   - Primary price is stale (no Swap events for StaleThreshold)
 //   - Cross-check: alerts if OKX and on-chain prices deviate > MaxDeviation
 type DualPriceFeed struct {
-	cfg    DualPriceFeedConfig
-	pools  map[TokenPair]poolConfig
+	cfg   DualPriceFeedConfig
+	pools map[TokenPair]poolConfig
 
-	mu      sync.RWMutex
-	prices  map[TokenPair]dualPrice
-	subs    map[TokenPair][]chan PriceUpdate
-	active  map[TokenPair]context.CancelFunc
+	mu     sync.RWMutex
+	prices map[TokenPair]dualPrice
+	subs   map[TokenPair][]chan PriceUpdate
+	active map[TokenPair]context.CancelFunc
 
 	wg sync.WaitGroup
 }
@@ -70,7 +70,7 @@ type dualPrice struct {
 	okx       *big.Int // From OKX API (cross-check)
 	price     *big.Int // Final published price
 	timestamp int64
-	source    string   // "onchain", "okx", "onchain+okx"
+	source    string // "onchain", "okx", "onchain+okx"
 }
 
 // Swap event signature for Uniswap V3 / PancakeSwap V3 pools.
@@ -95,8 +95,8 @@ func init() {
 
 // NewDualPriceFeed creates a dual-source price feed.
 func NewDualPriceFeed(cfg DualPriceFeedConfig) (*DualPriceFeed, error) {
-	if cfg.WSClient == nil {
-		return nil, fmt.Errorf("WSClient is required")
+	if cfg.WSClients == nil {
+		return nil, fmt.Errorf("WSClients are required")
 	}
 	if len(cfg.Pools) == 0 {
 		return nil, fmt.Errorf("at least one pool is required")
@@ -133,6 +133,11 @@ func (f *DualPriceFeed) Subscribe(ctx context.Context, pair TokenPair) (<-chan P
 		return nil, fmt.Errorf("no pool configured for pair %v", pair)
 	}
 
+	client, ok := f.cfg.WSClients[pair.ChainID]
+	if !ok {
+		return nil, fmt.Errorf("client not supported for chain id: %d", pair.ChainID)
+	}
+
 	ch := make(chan PriceUpdate, 16)
 
 	f.mu.Lock()
@@ -144,7 +149,7 @@ func (f *DualPriceFeed) Subscribe(ctx context.Context, pair TokenPair) (<-chan P
 
 		// Read initial price synchronously before starting event listeners.
 		pool := f.pools[pair]
-		if price, err := f.readSlot0(pairCtx, pool); err == nil {
+		if price, err := f.readSlot0(pairCtx, client, pool); err == nil {
 			now := time.Now().Unix()
 			f.prices[pair] = dualPrice{onChain: price, price: price, timestamp: now, source: "onchain"}
 		}
@@ -153,7 +158,7 @@ func (f *DualPriceFeed) Subscribe(ctx context.Context, pair TokenPair) (<-chan P
 		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
-			f.runSwapListener(pairCtx, pair)
+			f.runSwapListener(pairCtx, client, pair)
 		}()
 
 		// Start OKX cross-check if configured.
@@ -169,7 +174,7 @@ func (f *DualPriceFeed) Subscribe(ctx context.Context, pair TokenPair) (<-chan P
 		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
-			f.runStaleWatchdog(pairCtx, pair)
+			f.runStaleWatchdog(pairCtx, client, pair)
 		}()
 	}
 	f.mu.Unlock()
@@ -213,31 +218,31 @@ func (f *DualPriceFeed) Close() {
 // runSwapListener subscribes to Swap events on the pool via WebSocket.
 // On each event, reads slot0() for the current exact price.
 // If the WS subscription drops, falls back to polling until reconnected.
-func (f *DualPriceFeed) runSwapListener(ctx context.Context, pair TokenPair) {
+func (f *DualPriceFeed) runSwapListener(ctx context.Context, client WebSocketClient, pair TokenPair) {
 	pool := f.pools[pair]
 	swapEventID := swapEventABI.Events["Swap"].ID
 
 	for {
-		if err := f.listenSwapEvents(ctx, pair, pool, swapEventID); err != nil {
+		if err := f.listenSwapEvents(ctx, client, pair, pool, swapEventID); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			// WS dropped — fall back to polling briefly, then retry WS.
-			f.pollFallback(ctx, pair, pool, 5*time.Second)
+			f.pollFallback(ctx, client, pair, pool, 5*time.Second)
 		}
 	}
 }
 
 // listenSwapEvents sets up a log subscription for Swap events.
 // Returns when the subscription errors or context is cancelled.
-func (f *DualPriceFeed) listenSwapEvents(ctx context.Context, pair TokenPair, pool poolConfig, swapEventID common.Hash) error {
+func (f *DualPriceFeed) listenSwapEvents(ctx context.Context, client WebSocketClient, pair TokenPair, pool poolConfig, swapEventID common.Hash) error {
 	logCh := make(chan types.Log, 64)
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{pool.Address},
 		Topics:    [][]common.Hash{{swapEventID}},
 	}
 
-	sub, err := f.cfg.WSClient.SubscribeFilterLogs(ctx, query, logCh)
+	sub, err := client.SubscribeFilterLogs(ctx, query, logCh)
 	if err != nil {
 		return fmt.Errorf("subscribe swap logs: %w", err)
 	}
@@ -287,7 +292,7 @@ func (f *DualPriceFeed) priceFromSwapLog(log types.Log, pool poolConfig) *big.In
 }
 
 // pollFallback polls slot0() at short intervals when WS is down.
-func (f *DualPriceFeed) pollFallback(ctx context.Context, pair TokenPair, pool poolConfig, duration time.Duration) {
+func (f *DualPriceFeed) pollFallback(ctx context.Context, client WebSocketClient, pair TokenPair, pool poolConfig, duration time.Duration) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -299,7 +304,7 @@ func (f *DualPriceFeed) pollFallback(ctx context.Context, pair TokenPair, pool p
 		case <-deadline:
 			return
 		case <-ticker.C:
-			price, err := f.readSlot0(ctx, pool)
+			price, err := f.readSlot0(ctx, client, pool)
 			if err != nil {
 				continue
 			}
@@ -351,7 +356,7 @@ func (f *DualPriceFeed) runOKXPoller(ctx context.Context, pair TokenPair) {
 }
 
 // runStaleWatchdog checks if the on-chain price is stale and forces a slot0 read.
-func (f *DualPriceFeed) runStaleWatchdog(ctx context.Context, pair TokenPair) {
+func (f *DualPriceFeed) runStaleWatchdog(ctx context.Context, client WebSocketClient, pair TokenPair) {
 	pool := f.pools[pair]
 	ticker := time.NewTicker(f.cfg.StaleThreshold / 2)
 	defer ticker.Stop()
@@ -368,7 +373,7 @@ func (f *DualPriceFeed) runStaleWatchdog(ctx context.Context, pair TokenPair) {
 			age := time.Since(time.Unix(dp.timestamp, 0))
 			if age > f.cfg.StaleThreshold {
 				// Force a slot0 read.
-				price, err := f.readSlot0(ctx, pool)
+				price, err := f.readSlot0(ctx, client, pool)
 				if err != nil {
 					// If slot0 also fails and OKX is available, use OKX as emergency fallback.
 					f.mu.RLock()
@@ -424,13 +429,13 @@ func (f *DualPriceFeed) publishPrice(pair TokenPair, price *big.Int, source stri
 }
 
 // readSlot0 reads the current price from the pool's slot0().
-func (f *DualPriceFeed) readSlot0(ctx context.Context, pool poolConfig) (*big.Int, error) {
+func (f *DualPriceFeed) readSlot0(ctx context.Context, client WebSocketClient, pool poolConfig) (*big.Int, error) {
 	calldata, err := poolABI.Pack("slot0")
 	if err != nil {
 		return nil, err
 	}
 
-	result, err := f.cfg.WSClient.CallContract(ctx, ethereum.CallMsg{
+	result, err := client.CallContract(ctx, ethereum.CallMsg{
 		To:   &pool.Address,
 		Data: calldata,
 	}, nil)
@@ -453,11 +458,11 @@ func (f *DualPriceFeed) readSlot0(ctx context.Context, pool poolConfig) (*big.In
 type okxTickerResponse struct {
 	Code string `json:"code"`
 	Data []struct {
-		InstID  string `json:"instId"`
-		Last    string `json:"last"`
-		BidPx   string `json:"bidPx"`
-		AskPx   string `json:"askPx"`
-		Ts      string `json:"ts"`
+		InstID string `json:"instId"`
+		Last   string `json:"last"`
+		BidPx  string `json:"bidPx"`
+		AskPx  string `json:"askPx"`
+		Ts     string `json:"ts"`
 	} `json:"data"`
 }
 

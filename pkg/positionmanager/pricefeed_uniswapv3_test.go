@@ -169,7 +169,7 @@ func TestNewUniswapV3PriceFeed(t *testing.T) {
 	poolAddr := common.HexToAddress("0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8")
 	client := newMockChainClient()
 
-	feed := NewUniswapV3PriceFeed(client, []UniswapV3PoolDef{
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, []UniswapV3PoolDef{
 		{Pair: pair, PoolAddress: poolAddr, Token0Decimals: 6, Token1Decimals: 18, Token0IsBase: false},
 	}, 0)
 
@@ -186,7 +186,7 @@ func TestNewUniswapV3PriceFeed(t *testing.T) {
 
 func TestNewUniswapV3PriceFeed_TWAP(t *testing.T) {
 	client := newMockChainClient()
-	feed := NewUniswapV3PriceFeed(client, nil, 60)
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, nil, 60)
 
 	if feed.twapSecs != 60 {
 		t.Errorf("expected twapSecs=60, got %d", feed.twapSecs)
@@ -195,7 +195,7 @@ func TestNewUniswapV3PriceFeed_TWAP(t *testing.T) {
 
 func TestSubscribe_UnknownPair(t *testing.T) {
 	client := newMockChainClient()
-	feed := NewUniswapV3PriceFeed(client, nil, 0)
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, nil, 0)
 
 	_, err := feed.Subscribe(context.Background(), pricefeedTestPair())
 	if err == nil {
@@ -205,7 +205,7 @@ func TestSubscribe_UnknownPair(t *testing.T) {
 
 func TestLatest_NoPriceAvailable(t *testing.T) {
 	client := newMockChainClient()
-	feed := NewUniswapV3PriceFeed(client, nil, 0)
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, nil, 0)
 
 	_, _, err := feed.Latest(pricefeedTestPair())
 	if err == nil {
@@ -216,7 +216,7 @@ func TestLatest_NoPriceAvailable(t *testing.T) {
 func TestLatest_ReturnsCachedPrice(t *testing.T) {
 	client := newMockChainClient()
 	pair := pricefeedTestPair()
-	feed := NewUniswapV3PriceFeed(client, nil, 0)
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, nil, 0)
 
 	// Manually inject a cached price.
 	feed.mu.Lock()
@@ -247,7 +247,7 @@ func TestClose_StopsPolling(t *testing.T) {
 	poolAddr := common.HexToAddress("0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8")
 	client := newMockChainClient()
 
-	feed := NewUniswapV3PriceFeed(client, []UniswapV3PoolDef{
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, []UniswapV3PoolDef{
 		{Pair: pair, PoolAddress: poolAddr, Token0Decimals: 6, Token1Decimals: 18, Token0IsBase: false},
 	}, 0)
 
@@ -287,7 +287,7 @@ func TestShutdown_RespectsDeadline(t *testing.T) {
 	poolAddr := common.HexToAddress("0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8")
 	client := newMockChainClient()
 
-	feed := NewUniswapV3PriceFeed(client, []UniswapV3PoolDef{
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, []UniswapV3PoolDef{
 		{Pair: pair, PoolAddress: poolAddr, Token0Decimals: 6, Token1Decimals: 18, Token0IsBase: false},
 	}, 0)
 
@@ -313,7 +313,7 @@ func TestSubscribe_MultipleSubscribers(t *testing.T) {
 	poolAddr := common.HexToAddress("0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8")
 	client := newMockChainClient()
 
-	feed := NewUniswapV3PriceFeed(client, []UniswapV3PoolDef{
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, []UniswapV3PoolDef{
 		{Pair: pair, PoolAddress: poolAddr, Token0Decimals: 6, Token1Decimals: 18, Token0IsBase: false},
 	}, 0)
 	defer feed.Close()
@@ -366,7 +366,7 @@ func TestSubscribe_LastSubCancelStopsPolling(t *testing.T) {
 	poolAddr := common.HexToAddress("0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8")
 	client := newMockChainClient()
 
-	feed := NewUniswapV3PriceFeed(client, []UniswapV3PoolDef{
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, []UniswapV3PoolDef{
 		{Pair: pair, PoolAddress: poolAddr, Token0Decimals: 6, Token1Decimals: 18, Token0IsBase: false},
 	}, 0)
 
@@ -404,7 +404,7 @@ func TestPollLoop_SkipsDuplicatePrice(t *testing.T) {
 	// We test by directly inspecting cached price behavior.
 	pair := pricefeedTestPair()
 	client := newMockChainClient()
-	feed := NewUniswapV3PriceFeed(client, nil, 0)
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, nil, 0)
 
 	price := big.NewInt(200000000000)
 

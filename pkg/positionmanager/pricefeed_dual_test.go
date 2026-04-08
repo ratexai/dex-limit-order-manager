@@ -27,7 +27,7 @@ type mockLogSubscription struct {
 }
 
 func (s *mockLogSubscription) Err() <-chan error { return s.errCh }
-func (s *mockLogSubscription) Unsubscribe()     { close(s.errCh) }
+func (s *mockLogSubscription) Unsubscribe()      { close(s.errCh) }
 
 func (c *mockWSClient) SubscribeFilterLogs(_ context.Context, _ ethereum.FilterQuery, ch chan<- types.Log) (ethereum.Subscription, error) {
 	c.mu.Lock()
@@ -91,11 +91,11 @@ func testDualPoolDef() UniswapV3PoolDef {
 func TestNewDualPriceFeed_Validation(t *testing.T) {
 	_, err := NewDualPriceFeed(DualPriceFeedConfig{})
 	if err == nil {
-		t.Error("expected error for nil WSClient")
+		t.Error("expected error for nil WSClients")
 	}
 
 	_, err = NewDualPriceFeed(DualPriceFeedConfig{
-		WSClient: newMockWSClient(),
+		WSClients: map[uint64]WebSocketClient{1: newMockWSClient()},
 	})
 	if err == nil {
 		t.Error("expected error for empty pools")
@@ -105,8 +105,8 @@ func TestNewDualPriceFeed_Validation(t *testing.T) {
 func TestNewDualPriceFeed_DefaultConfig(t *testing.T) {
 	ws := newMockWSClient()
 	feed, err := NewDualPriceFeed(DualPriceFeedConfig{
-		WSClient: ws,
-		Pools:    []UniswapV3PoolDef{testDualPoolDef()},
+		WSClients: map[uint64]WebSocketClient{1: ws},
+		Pools:     []UniswapV3PoolDef{testDualPoolDef()},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -122,8 +122,8 @@ func TestNewDualPriceFeed_DefaultConfig(t *testing.T) {
 func TestDualPriceFeed_LatestWithoutSubscribe(t *testing.T) {
 	ws := newMockWSClient()
 	feed, _ := NewDualPriceFeed(DualPriceFeedConfig{
-		WSClient: ws,
-		Pools:    []UniswapV3PoolDef{testDualPoolDef()},
+		WSClients: map[uint64]WebSocketClient{1: ws},
+		Pools:     []UniswapV3PoolDef{testDualPoolDef()},
 	})
 	defer feed.Close()
 
@@ -141,11 +141,11 @@ func TestComputeDeviationBps(t *testing.T) {
 		expected uint16
 	}{
 		{100, 100, 0},
-		{100, 102, 200},  // 2%
-		{100, 98, 200},   // 2%
-		{100, 105, 500},  // 5%
-		{100, 0, 10000},  // max deviation
-		{0, 100, 10000},  // max deviation
+		{100, 102, 200}, // 2%
+		{100, 98, 200},  // 2%
+		{100, 105, 500}, // 5%
+		{100, 0, 10000}, // max deviation
+		{0, 100, 10000}, // max deviation
 	}
 
 	for _, tt := range tests {
@@ -211,8 +211,8 @@ func TestMockWSClient_PushSwapLog(t *testing.T) {
 func TestDualPriceFeed_Close(t *testing.T) {
 	ws := newMockWSClient()
 	feed, _ := NewDualPriceFeed(DualPriceFeedConfig{
-		WSClient: ws,
-		Pools:    []UniswapV3PoolDef{testDualPoolDef()},
+		WSClients: map[uint64]WebSocketClient{1: ws},
+		Pools:     []UniswapV3PoolDef{testDualPoolDef()},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
