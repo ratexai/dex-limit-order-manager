@@ -104,14 +104,14 @@ func TestTriggerEngine_UpdateTriggerPrice(t *testing.T) {
 	// Move SL to 2000.
 	e.UpdateTriggerPrice(pair, posID(1), 0, LevelTypeSL, Long, big.NewInt(200000000000))
 
-	// Price at 1900 — should NOT trigger (SL moved to 2000).
-	events := e.OnPrice(pair, big.NewInt(190000000000))
+	// Price at 2100 — should NOT trigger (SL at 2000, Long SL fires when price <= trigger).
+	events := e.OnPrice(pair, big.NewInt(210000000000))
 	if len(events) != 0 {
-		t.Fatalf("expected 0 events after SL move, got %d", len(events))
+		t.Fatalf("expected 0 events at price above SL, got %d", len(events))
 	}
 
-	// Price drops to 2000 — should trigger.
-	events = e.OnPrice(pair, big.NewInt(200000000000))
+	// Price drops to 1900 — should trigger (1900 <= 2000).
+	events = e.OnPrice(pair, big.NewInt(190000000000))
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}

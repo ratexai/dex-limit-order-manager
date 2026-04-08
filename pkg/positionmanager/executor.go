@@ -279,8 +279,9 @@ func parseAmountOutFromReceipt(receipt *types.Receipt, executorAddr common.Addre
 // packSwapCalldata builds the ABI-encoded calldata for the appropriate swap function
 // based on the execution mode.
 func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
+	// go-ethereum ABI packer expects native Go types matching Solidity types:
+	// uint24 (poolFee) → *big.Int, uint16 (feeBps) → uint16
 	poolFeeBig := new(big.Int).SetUint64(uint64(params.PoolFee))
-	feeBpsBig := new(big.Int).SetUint64(uint64(params.FeeBps))
 
 	switch params.Mode {
 	case ExecModeLegacy:
@@ -293,7 +294,7 @@ func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
 			poolFeeBig,
 			params.AmountIn,
 			params.MinAmountOut,
-			feeBpsBig,
+			params.FeeBps,
 		)
 
 	case ExecModePermit2Allowance:
@@ -306,7 +307,7 @@ func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
 			poolFeeBig,
 			params.AmountIn,
 			params.MinAmountOut,
-			feeBpsBig,
+			params.FeeBps,
 		)
 
 	case ExecModePermit2Signature:
@@ -335,7 +336,7 @@ func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
 			params.TokenOut,
 			poolFeeBig,
 			params.MinAmountOut,
-			feeBpsBig,
+			params.FeeBps,
 			permit,
 			params.PermitSignature,
 		)
@@ -347,7 +348,22 @@ func (e *executor) packSwapCalldata(params executeSwapParams) ([]byte, error) {
 
 // activatePermit submits a transaction to activate a Permit2 allowance on-chain.
 // This is called once per position before the first level execution.
+// Permit2 type bounds: prevent silent ABI truncation.
+var maxUint48 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 48), big.NewInt(1))   // 2^48 - 1
+var maxUint160 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1)) // 2^160 - 1
+
 func (e *executor) activatePermit(ctx context.Context, params activatePermitParams) (common.Hash, error) {
+	// Validate Permit2 type bounds to prevent silent ABI truncation.
+	if params.Amount != nil && params.Amount.Cmp(maxUint160) > 0 {
+		return common.Hash{}, fmt.Errorf("permit amount exceeds uint160 max")
+	}
+	if params.Expiration > maxUint48.Uint64() {
+		return common.Hash{}, fmt.Errorf("permit expiration exceeds uint48 max")
+	}
+	if params.Nonce > maxUint48.Uint64() {
+		return common.Hash{}, fmt.Errorf("permit nonce exceeds uint48 max")
+	}
+
 	// Build the PermitSingle struct for the ABI call.
 	type permitDetails struct {
 		Token      common.Address
@@ -442,10 +458,43 @@ func (e *executor) activatePermit(ctx context.Context, params activatePermitPara
 // broadcastSignedApproveTx broadcasts a user-signed approve TX (for one-click flow).
 // The frontend silently signs token.approve(Permit2, MAX) and sends the signed TX bytes.
 // Keeper broadcasts it and waits for confirmation before proceeding with the swap.
+//
+// Security: validates that the TX calldata is an ERC20 approve() call (selector 0x095ea7b3)
+// targeting the Permit2 canonical address. Rejects any other function or spender.
 func (e *executor) broadcastSignedApproveTx(ctx context.Context, signedTxBytes []byte) (common.Hash, error) {
 	tx := new(types.Transaction)
 	if err := tx.UnmarshalBinary(signedTxBytes); err != nil {
 		return common.Hash{}, fmt.Errorf("decode signed approve tx: %w", err)
+	}
+
+	// Validate: must be a call (not a contract creation).
+	if tx.To() == nil {
+		return common.Hash{}, fmt.Errorf("approve tx has no 'to' address (contract creation not allowed)")
+	}
+
+	// Validate: calldata must be an ERC20 approve(address spender, uint256 amount) call.
+	// Function selector: 0x095ea7b3
+	data := tx.Data()
+	if len(data) < 4+32+32 { // 4-byte selector + address + uint256
+		return common.Hash{}, fmt.Errorf("approve tx calldata too short (%d bytes)", len(data))
+	}
+	approveSelector := [4]byte{0x09, 0x5e, 0xa7, 0xb3}
+	if data[0] != approveSelector[0] || data[1] != approveSelector[1] ||
+		data[2] != approveSelector[2] || data[3] != approveSelector[3] {
+		return common.Hash{}, fmt.Errorf("approve tx has wrong function selector (expected approve)")
+	}
+
+	// Validate: spender must be Permit2 canonical address.
+	// The spender is the first argument (bytes 4-36, right-padded address at bytes 16-36).
+	spender := common.BytesToAddress(data[4:36])
+	permit2Addr := common.HexToAddress(Permit2CanonicalAddress)
+	if spender != permit2Addr {
+		return common.Hash{}, fmt.Errorf("approve tx spender is %s, expected Permit2 %s", spender.Hex(), permit2Addr.Hex())
+	}
+
+	// Validate: TX must not send ETH value.
+	if tx.Value() != nil && tx.Value().Sign() > 0 {
+		return common.Hash{}, fmt.Errorf("approve tx must not send ETH value")
 	}
 
 	if err := e.client.SendTransaction(ctx, tx); err != nil {

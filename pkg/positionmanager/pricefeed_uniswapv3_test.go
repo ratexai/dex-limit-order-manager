@@ -148,7 +148,7 @@ func TestTickToPrice_DifferentDecimals(t *testing.T) {
 	price := tickToPrice(0, 18, 6, true)
 
 	// price = 1.0 * 10^(18-6) * 1e8 = 1e20
-	expected := new(big.Int).SetUint64(1e20)
+	expected := new(big.Int).Exp(big.NewInt(10), big.NewInt(20), nil)
 	if price.Cmp(expected) != 0 {
 		t.Errorf("tick 0 diff decimals: expected %s, got %s", expected, price)
 	}

@@ -2,6 +2,7 @@ package positionmanager
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"strings"
 	"sync"
@@ -99,7 +100,7 @@ func testOpenParams() OpenParams {
 			{
 				Type:         LevelTypeSL,
 				TriggerPrice: big.NewInt(180000000000), // $1800
-				PortionBps:   10000,                     // 100%
+				PortionBps:   5000,                      // 50%
 			},
 			{
 				Type:         LevelTypeTP,
@@ -653,10 +654,10 @@ func TestExecuteTrigger_SLFires(t *testing.T) {
 		t.Errorf("TP level should be cancelled after SL, got %v", updated.Levels[1].Status)
 	}
 
-	// RemainingSize should be reduced.
-	if updated.RemainingSize.Sign() > 0 {
-		// For 100% SL on full remaining, should be zero.
-		t.Errorf("remaining size should be 0 after 100%% SL, got %s", updated.RemainingSize)
+	// RemainingSize should be reduced (SL is 50% of remaining).
+	expectedRemaining := new(big.Int).Div(pos.TotalSize, big.NewInt(2))
+	if updated.RemainingSize.Cmp(expectedRemaining) != 0 {
+		t.Errorf("remaining size should be %s after 50%% SL, got %s", expectedRemaining, updated.RemainingSize)
 	}
 
 	// Verify execution event was emitted.
@@ -763,6 +764,9 @@ func TestExecuteTrigger_TPWithCancelOnFire(t *testing.T) {
 	ctx := context.Background()
 
 	params := testOpenParams()
+	// Adjust portions to fit under 10000: SL=4000, TP1=3000, TP2=3000 = 10000.
+	params.Levels[0].PortionBps = 4000
+	params.Levels[1].PortionBps = 3000
 	// Add a second TP at index 2.
 	params.Levels = append(params.Levels, LevelParams{
 		Type:         LevelTypeTP,
@@ -772,7 +776,10 @@ func TestExecuteTrigger_TPWithCancelOnFire(t *testing.T) {
 	// First TP (index 1) cancels the second TP (index 2) on fire.
 	params.Levels[1].CancelOnFire = []int{2}
 
-	pos, _ := h.manager.OpenPosition(ctx, params)
+	pos, err := h.manager.OpenPosition(ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Fire first TP.
 	evt := TriggerEvent{
@@ -1126,6 +1133,7 @@ func TestOpenPosition_WithInsufficientPermitAmount(t *testing.T) {
 	params.PermitSignature = sig
 	params.PermitNonce = new(big.Int)
 	params.PermitDeadline = deadline
+	params.PermitAmount = smallAmount // Pass the actual signed amount.
 
 	_, err = h.manager.OpenPosition(context.Background(), params)
 	if err == nil {
@@ -1175,7 +1183,7 @@ func TestRenewPermit_Success(t *testing.T) {
 	}
 	newSig[64] += 27
 
-	err = h.manager.RenewPermit(context.Background(), pos.ID, newSig, big.NewInt(1), newDeadline, pos.PermitAmount)
+	err = h.manager.RenewPermit(context.Background(), pos.ID, pos.Owner, newSig, big.NewInt(1), newDeadline, pos.PermitAmount)
 	if err != nil {
 		t.Fatalf("RenewPermit failed: %v", err)
 	}
@@ -1213,7 +1221,7 @@ func TestRenewPermit_TerminalPosition(t *testing.T) {
 	// Cancel the position.
 	h.manager.CancelPosition(context.Background(), pos.ID)
 
-	err = h.manager.RenewPermit(context.Background(), pos.ID, []byte("newsig"), big.NewInt(1), time.Now().Add(24*time.Hour).Unix(), pos.PermitAmount)
+	err = h.manager.RenewPermit(context.Background(), pos.ID, pos.Owner, []byte("newsig"), big.NewInt(1), time.Now().Add(24*time.Hour).Unix(), pos.PermitAmount)
 	if err == nil {
 		t.Fatal("expected error for terminal position")
 	}
@@ -1226,7 +1234,7 @@ func TestExecuteTrigger_SuspendsOnExpiredPermit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	executorAddr := h.manager.cfg.Chains[1].ExecutorAddress
+	_ = h.manager.cfg.Chains[1].ExecutorAddress
 	owner := crypto.PubkeyToAddress(key.PublicKey)
 
 	// Create position with permit that has a past deadline.

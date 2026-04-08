@@ -665,6 +665,7 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 
 	// Validate Permit2 authorization if provided.
 	var permitToken common.Address
+	var permitAmount *big.Int
 	if len(params.PermitSignature) > 0 {
 		ci := m.cfg.Chains[params.ChainID]
 
@@ -675,9 +676,15 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 			permitToken = params.TokenQuote
 		}
 
+		// Use the amount the user actually signed for (may be >= Size).
+		permitAmount = params.PermitAmount
+		if permitAmount == nil {
+			permitAmount = params.Size // Fallback: assume user signed for exact size.
+		}
+
 		permitData := PermitSingleData{
 			Token:       permitToken,
-			Amount:      params.Size,
+			Amount:      permitAmount,
 			Expiration:  uint64(params.PermitDeadline),
 			Nonce:       0,
 			Spender:     ci.ExecutorAddress,
@@ -756,7 +763,7 @@ func (m *Manager) OpenPosition(ctx context.Context, params OpenParams) (*Positio
 	if len(params.PermitSignature) > 0 {
 		pos.PermitSignature = params.PermitSignature
 		pos.PermitDeadline = params.PermitDeadline
-		pos.PermitAmount = new(big.Int).Set(params.Size)
+		pos.PermitAmount = new(big.Int).Set(permitAmount)
 		pos.PermitToken = permitToken
 		if params.PermitNonce != nil {
 			pos.PermitNonce = new(big.Int).Set(params.PermitNonce)
@@ -1056,10 +1063,13 @@ func (m *Manager) suspendPositionLevels(pos *Position) {
 
 // RenewPermit updates a position's permit data after the user signs a new one.
 // Reactivates any suspended levels.
-func (m *Manager) RenewPermit(ctx context.Context, posID [16]byte, signature []byte, nonce *big.Int, deadline int64, amount *big.Int) error {
+func (m *Manager) RenewPermit(ctx context.Context, posID [16]byte, owner common.Address, signature []byte, nonce *big.Int, deadline int64, amount *big.Int) error {
 	pos, err := m.cfg.Store.Get(ctx, posID)
 	if err != nil {
 		return err
+	}
+	if pos.Owner != owner {
+		return fmt.Errorf("caller %s is not position owner %s", owner.Hex(), pos.Owner.Hex())
 	}
 	if pos.State.IsTerminal() {
 		return fmt.Errorf("position is %s", pos.State)

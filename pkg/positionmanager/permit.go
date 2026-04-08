@@ -90,6 +90,12 @@ func Permit2EIP712Hash(data PermitSingleData, chainID uint64, permit2Address com
 
 // RecoverPermitSigner recovers the signer address from a Permit2 EIP-712 signature.
 // Returns the recovered address or an error if recovery fails.
+// secp256k1N is the order of the secp256k1 curve.
+var secp256k1N, _ = new(big.Int).SetString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
+
+// secp256k1HalfN is N/2, used for low-s signature malleability check.
+var secp256k1HalfN = new(big.Int).Rsh(secp256k1N, 1)
+
 func RecoverPermitSigner(data PermitSingleData, chainID uint64, permit2Address common.Address, signature []byte) (common.Address, error) {
 	if len(signature) != 65 {
 		return common.Address{}, fmt.Errorf("invalid signature length: %d (expected 65)", len(signature))
@@ -102,6 +108,13 @@ func RecoverPermitSigner(data PermitSingleData, chainID uint64, permit2Address c
 	copy(sig, signature)
 	if sig[64] >= 27 {
 		sig[64] -= 27
+	}
+
+	// Enforce canonical form (low-s) to prevent signature malleability.
+	// EIP-2: s must be in the lower half of the curve order.
+	s := new(big.Int).SetBytes(sig[32:64])
+	if s.Cmp(secp256k1HalfN) > 0 {
+		return common.Address{}, fmt.Errorf("signature malleability: s value is not in lower half of curve order")
 	}
 
 	pubKey, err := crypto.Ecrecover(hash.Bytes(), sig)
@@ -139,6 +152,17 @@ func ValidatePermitForPosition(
 	signature []byte,
 	minLifetime time.Duration,
 ) error {
+	// 0. Nil safety — prevent panics from uninitialized big.Int fields.
+	if size == nil || size.Sign() <= 0 {
+		return fmt.Errorf("position size is nil or zero")
+	}
+	if permitData.Amount == nil {
+		return fmt.Errorf("permit amount is nil")
+	}
+	if permitData.SigDeadline == nil {
+		return fmt.Errorf("permit sigDeadline is nil")
+	}
+
 	// 1. Recover signer and verify it matches the owner.
 	signer, err := RecoverPermitSigner(permitData, chainID, permit2Address, signature)
 	if err != nil {
@@ -173,6 +197,11 @@ func ValidatePermitForPosition(
 	// 6. Verify spender is our executor contract.
 	if permitData.Spender != executorAddress {
 		return fmt.Errorf("permit spender %s does not match executor %s", permitData.Spender.Hex(), executorAddress.Hex())
+	}
+
+	// 7. Verify sigDeadline is not in the past.
+	if permitData.SigDeadline.Int64() <= now {
+		return fmt.Errorf("permit sigDeadline %d has passed (now=%d)", permitData.SigDeadline.Int64(), now)
 	}
 
 	return nil

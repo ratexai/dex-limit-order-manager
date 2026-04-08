@@ -122,7 +122,7 @@ func TestComputeFeeResult_NoReferrer(t *testing.T) {
 
 func TestComputeFeeResult_WithReferrer(t *testing.T) {
 	amountIn := big.NewInt(10000)
-	referrer := common.HexToAddress("0xReferrer")
+	referrer := common.HexToAddress("0xABCDEF1234567890ABCDEF1234567890ABCDEF12")
 	result := computeFeeResult(amountIn, &FeeConfig{
 		FeeBps:        100,  // 1%
 		ReferrerShare: 3000, // 30% of fee

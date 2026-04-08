@@ -252,6 +252,10 @@ func (f *DualPriceFeed) listenSwapEvents(ctx context.Context, pair TokenPair, po
 			return fmt.Errorf("swap subscription error: %w", err)
 
 		case log := <-logCh:
+			// Skip reorged logs (chain reorganization).
+			if log.Removed {
+				continue
+			}
 			// Swap event received — extract sqrtPriceX96 directly from log data.
 			price := f.priceFromSwapLog(log, pool)
 			if price != nil {
@@ -327,7 +331,7 @@ func (f *DualPriceFeed) runOKXPoller(ctx context.Context, pair TokenPair) {
 
 			f.mu.Lock()
 			dp := f.prices[pair]
-			dp.okx = price
+			dp.okx = new(big.Int).Set(price)
 
 			// Cross-check: if both sources available, check deviation.
 			if dp.onChain != nil && dp.onChain.Sign() > 0 && price.Sign() > 0 {
@@ -389,13 +393,13 @@ func (f *DualPriceFeed) publishPrice(pair TokenPair, price *big.Int, source stri
 	dp := f.prices[pair]
 
 	// Skip if price unchanged.
-	if dp.price != nil && dp.price.Cmp(price) == 0 {
+	if dp.price != nil && price != nil && dp.price.Cmp(price) == 0 {
 		f.mu.Unlock()
 		return
 	}
 
-	dp.onChain = price
-	dp.price = price
+	dp.onChain = new(big.Int).Set(price)
+	dp.price = new(big.Int).Set(price)
 	dp.timestamp = now
 	dp.source = source
 	f.prices[pair] = dp
@@ -406,7 +410,7 @@ func (f *DualPriceFeed) publishPrice(pair TokenPair, price *big.Int, source stri
 
 	update := PriceUpdate{
 		Pair:      pair,
-		Price:     price,
+		Price:     new(big.Int).Set(price),
 		Block:     block,
 		Timestamp: now,
 	}
@@ -469,19 +473,16 @@ func (f *DualPriceFeed) fetchOKXPrice(ctx context.Context, pair TokenPair) (*big
 		timeout = 5 * time.Second
 	}
 
-	pool, ok := f.pools[pair]
-	if !ok {
+	if _, ok := f.pools[pair]; !ok {
 		return nil, fmt.Errorf("no pool for pair")
 	}
 
-	// OKX DEX API: /api/v5/dex/aggregator/all-tokens or market ticker.
-	// For DEX prices, use the token addresses directly.
-	// Format: GET /api/v5/market/ticker?instId=<base>-<quote>
-	// For on-chain DEX tokens, use the aggregator quote endpoint.
+	// OKX DEX Aggregator quote API: get price by quoting a swap of base → quote.
+	// Uses actual token addresses from the pair (not pool address).
 	url := fmt.Sprintf("%s/api/v5/dex/aggregator/quote?chainId=%s&amount=1000000000000000000&fromTokenAddress=%s&toTokenAddress=%s",
 		baseURL,
 		okxCfg.ChainIndex,
-		pool.Address.Hex(), // Using pool address as a proxy; in production use actual token addresses from pair.
+		pair.Base.Hex(),
 		pair.Quote.Hex(),
 	)
 
@@ -528,6 +529,8 @@ func parseFloatPrice(s string) (*big.Int, error) {
 		return nil, fmt.Errorf("invalid price string: %s", s)
 	}
 	scaled := new(big.Float).Mul(f, new(big.Float).SetFloat64(1e8))
+	// Add 0.5 before truncating to get proper rounding.
+	scaled.Add(scaled, new(big.Float).SetFloat64(0.5))
 	result, _ := scaled.Int(nil)
 	return result, nil
 }

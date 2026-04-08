@@ -189,6 +189,7 @@ type OpenParams struct {
 	PermitSignature []byte   // EIP-712 signature (65 bytes).
 	PermitNonce     *big.Int // Permit2 nonce.
 	PermitDeadline  int64    // Unix timestamp expiry.
+	PermitAmount    *big.Int // Amount the user signed for (must be >= Size).
 
 	// Optional: signed approve TX for one-click flow.
 	// If present, keeper broadcasts this before activating permit.

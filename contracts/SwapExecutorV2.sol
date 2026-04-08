@@ -204,6 +204,22 @@ contract SwapExecutorV2 is ReentrancyGuard {
         owner = _newOwner;
     }
 
+    /// @notice Rescue ETH accidentally sent to the contract.
+    function rescueETH(address payable _to) external onlyOwner {
+        if (_to == address(0)) revert ZeroAddress();
+        (bool sent, ) = _to.call{value: address(this).balance}("");
+        require(sent, "ETH transfer failed");
+    }
+
+    /// @notice Rescue ERC20 tokens accidentally sent to the contract.
+    function rescueToken(address _token, address _to) external onlyOwner {
+        if (_to == address(0)) revert ZeroAddress();
+        uint256 balance = IERC20(_token).balanceOf(address(this));
+        if (balance > 0) {
+            IERC20(_token).safeTransfer(_to, balance);
+        }
+    }
+
     // ─── Legacy: Direct ERC20 approve ─────────────────────────────────
 
     /// @notice Execute swap using direct ERC20 transferFrom (backward compat).
