@@ -1,6 +1,7 @@
 package positionmanager
 
 import (
+	"context"
 	"math/big"
 	"testing"
 
@@ -301,7 +302,7 @@ func TestBroadcastSignedApproveTx_InvalidRLP(t *testing.T) {
 		cfg:    EthereumDefaults(),
 	}
 
-	_, err := exec.broadcastSignedApproveTx(nil, []byte{0xDE, 0xAD})
+	_, err := exec.broadcastSignedApproveTx(context.TODO(), []byte{0xDE, 0xAD})
 	if err == nil {
 		t.Fatal("expected error for invalid RLP")
 	}

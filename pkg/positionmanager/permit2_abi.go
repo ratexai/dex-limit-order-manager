@@ -86,7 +86,8 @@ const swapExecutorV2ABIJSON = `[
       {"internalType": "address", "name": "_keeper", "type": "address"},
       {"internalType": "address", "name": "_swapRouter", "type": "address"},
       {"internalType": "address", "name": "_feeCollector", "type": "address"},
-      {"internalType": "address", "name": "_permit2", "type": "address"}
+      {"internalType": "address", "name": "_permit2", "type": "address"},
+      {"internalType": "address", "name": "_weth", "type": "address"}
     ],
     "stateMutability": "nonpayable",
     "type": "constructor"
@@ -217,13 +218,15 @@ const swapExecutorV2ABIJSON = `[
 ]`
 
 var (
-	parsedPermit2ABI         abi.ABI
+	// Permit2ABI is the parsed Permit2 contract ABI. Exported for host apps
+	// that need to construct Permit2.permit() or Permit2.transferFrom() calls directly.
+	Permit2ABI         abi.ABI
 	parsedSwapExecutorV2ABI  abi.ABI
 )
 
 func init() {
 	var err error
-	parsedPermit2ABI, err = abi.JSON(strings.NewReader(permit2ABIJSON))
+	Permit2ABI, err = abi.JSON(strings.NewReader(permit2ABIJSON))
 	if err != nil {
 		panic("failed to parse Permit2 ABI: " + err.Error())
 	}
