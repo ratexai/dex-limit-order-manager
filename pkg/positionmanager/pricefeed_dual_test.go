@@ -186,6 +186,28 @@ func TestParseFloatPrice_Invalid(t *testing.T) {
 	}
 }
 
+func TestMockWSClient_PushSwapLog(t *testing.T) {
+	ws := newMockWSClient()
+	pool := testDualPoolDef()
+
+	// Subscribe to capture the log.
+	logCh := make(chan types.Log, 1)
+	ws.SubscribeFilterLogs(context.Background(), ethereum.FilterQuery{}, logCh)
+
+	// Push a swap log with a known sqrtPriceX96.
+	sqrtPrice := new(big.Int).Mul(big.NewInt(1), new(big.Int).Exp(big.NewInt(2), big.NewInt(96), nil)) // 2^96 = price 1.0
+	ws.pushSwapLog(pool.PoolAddress, sqrtPrice)
+
+	select {
+	case log := <-logCh:
+		if log.Address != pool.PoolAddress {
+			t.Errorf("expected pool address %s, got %s", pool.PoolAddress.Hex(), log.Address.Hex())
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for swap log")
+	}
+}
+
 func TestDualPriceFeed_Close(t *testing.T) {
 	ws := newMockWSClient()
 	feed, _ := NewDualPriceFeed(DualPriceFeedConfig{
