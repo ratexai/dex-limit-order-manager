@@ -16,13 +16,13 @@ import (
 
 // executor handles on-chain swap execution via the SwapExecutor contract.
 type executor struct {
-	client          ChainClient
-	keeperKey       *ecdsa.PrivateKey
-	keeperAddr      common.Address
-	executorAddr    common.Address
-	chainID         *big.Int
-	cfg             ChainConfig
-	circuitBreaker  *CircuitBreaker
+	client         ChainClient
+	keeperKey      *ecdsa.PrivateKey
+	keeperAddr     common.Address
+	executorAddr   common.Address
+	chainID        *big.Int
+	cfg            ChainConfig
+	circuitBreaker *CircuitBreaker
 
 	nonceMu   sync.Mutex
 	nextNonce uint64
@@ -51,26 +51,26 @@ func newExecutor(client ChainClient, keeperKey *ecdsa.PrivateKey, executorAddr c
 type ExecutionMode uint8
 
 const (
-	ExecModeLegacy          ExecutionMode = iota // Direct ERC20 transferFrom.
-	ExecModePermit2Allowance                     // Permit2 AllowanceTransfer (multi-level positions).
-	ExecModePermit2Signature                     // Permit2 SignatureTransfer (single-use market swaps).
+	ExecModeLegacy           ExecutionMode = iota // Direct ERC20 transferFrom.
+	ExecModePermit2Allowance                      // Permit2 AllowanceTransfer (multi-level positions).
+	ExecModePermit2Signature                      // Permit2 SignatureTransfer (single-use market swaps).
 )
 
 // executeSwapParams holds the parameters for a single swap execution.
 type executeSwapParams struct {
-	User        common.Address
-	TokenIn     common.Address
-	TokenOut    common.Address
-	PoolFee     uint32
-	AmountIn    *big.Int
+	User         common.Address
+	TokenIn      common.Address
+	TokenOut     common.Address
+	PoolFee      uint32
+	AmountIn     *big.Int
 	MinAmountOut *big.Int
-	FeeBps      uint16
-	Priority    Priority
-	Mode        ExecutionMode
+	FeeBps       uint16
+	Priority     Priority
+	Mode         ExecutionMode
 
 	// Permit2 SignatureTransfer fields (Mode == ExecModePermit2Signature).
-	PermitNonce    *big.Int
-	PermitDeadline *big.Int
+	PermitNonce     *big.Int
+	PermitDeadline  *big.Int
 	PermitSignature []byte
 }
 
@@ -487,9 +487,8 @@ func (e *executor) broadcastSignedApproveTx(ctx context.Context, signedTxBytes [
 	// Validate: spender must be Permit2 canonical address.
 	// The spender is the first argument (bytes 4-36, right-padded address at bytes 16-36).
 	spender := common.BytesToAddress(data[4:36])
-	permit2Addr := common.HexToAddress(Permit2CanonicalAddress)
-	if spender != permit2Addr {
-		return common.Hash{}, fmt.Errorf("approve tx spender is %s, expected Permit2 %s", spender.Hex(), permit2Addr.Hex())
+	if spender != e.cfg.Permit2Address {
+		return common.Hash{}, fmt.Errorf("approve tx spender is %s, expected Permit2 %s", spender.Hex(), e.cfg.Permit2Address.Hex())
 	}
 
 	// Validate: TX must not send ETH value.

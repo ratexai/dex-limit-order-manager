@@ -77,8 +77,8 @@ type ChainConfig struct {
 	TPSlippageBps uint16 // Max slippage for TP execution (bps).
 
 	// MEV protection.
-	UseFlashbots    bool
-	FlashbotsRelay  string
+	UseFlashbots   bool
+	FlashbotsRelay string
 
 	// Retry.
 	MaxRetries         int
@@ -88,31 +88,28 @@ type ChainConfig struct {
 	CircuitBreaker CircuitBreakerConfig
 
 	// Permit2.
-	Permit2Address    common.Address // Canonical: 0x000000000022D473030F116dDEE9F6B43aC78BA3.
-	MinPermitLifetime time.Duration  // Min remaining lifetime for new permits (default: 1h).
-	PermitExpiryWarning time.Duration // Warn host this long before permit expiry (default: 48h).
+	Permit2Address      common.Address // Canonical: 0x000000000022D473030F116dDEE9F6B43aC78BA3.
+	MinPermitLifetime   time.Duration  // Min remaining lifetime for new permits (default: 1h).
+	PermitExpiryWarning time.Duration  // Warn host this long before permit expiry (default: 48h).
 }
-
-// permit2Addr is the canonical Permit2 address on all EVM chains.
-var permit2Addr = common.HexToAddress(Permit2CanonicalAddress)
 
 // EthereumDefaults returns sensible defaults for Ethereum mainnet.
 func EthereumDefaults() ChainConfig {
 	return ChainConfig{
-		ChainID:            1,
-		Name:               "ethereum",
-		BlockTime:          12 * time.Second,
-		ExecutorWorkers:    4,
-		SLGasMultiplier:    2.5,
-		TPGasMultiplier:    1.3,
-		MaxGasPrice:        new(big.Int).Mul(big.NewInt(200), big.NewInt(1e9)), // 200 gwei
-		SLSlippageBps:      200,
-		TPSlippageBps:      50,
-		UseFlashbots:       true,
-		FlashbotsRelay:     "https://relay.flashbots.net",
+		ChainID:             1,
+		Name:                "ethereum",
+		BlockTime:           12 * time.Second,
+		ExecutorWorkers:     4,
+		SLGasMultiplier:     2.5,
+		TPGasMultiplier:     1.3,
+		MaxGasPrice:         new(big.Int).Mul(big.NewInt(200), big.NewInt(1e9)), // 200 gwei
+		SLSlippageBps:       200,
+		TPSlippageBps:       50,
+		UseFlashbots:        true,
+		FlashbotsRelay:      "https://relay.flashbots.net",
 		MaxRetries:          3,
 		RetryGasEscalation:  1.5,
-		Permit2Address:      permit2Addr,
+		Permit2Address:      common.HexToAddress("0x000000000022D473030F116dDEE9F6B43aC78BA3"),
 		MinPermitLifetime:   1 * time.Hour,
 		PermitExpiryWarning: 48 * time.Hour,
 	}
@@ -133,7 +130,7 @@ func BaseDefaults() ChainConfig {
 		UseFlashbots:        false,
 		MaxRetries:          3,
 		RetryGasEscalation:  1.5,
-		Permit2Address:      permit2Addr,
+		Permit2Address:      common.HexToAddress("0x000000000022D473030F116dDEE9F6B43aC78BA3"),
 		MinPermitLifetime:   1 * time.Hour,
 		PermitExpiryWarning: 48 * time.Hour,
 	}
@@ -154,7 +151,7 @@ func BSCDefaults() ChainConfig {
 		UseFlashbots:        false, // No Flashbots on BSC, use private RPCs if needed.
 		MaxRetries:          3,
 		RetryGasEscalation:  1.5,
-		Permit2Address:      permit2Addr,
+		Permit2Address:      common.HexToAddress("0x31c2F6fcFf4F8759b3Bd5Bf0e1084A055615c768"),
 		MinPermitLifetime:   1 * time.Hour,
 		PermitExpiryWarning: 48 * time.Hour,
 	}
