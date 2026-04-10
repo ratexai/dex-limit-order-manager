@@ -225,7 +225,12 @@ func (f *UniswapV3PriceFeed) LookupPool(
 		ChainID: chainID,
 	}]
 	if ok {
-		return pool, nil
+		return PoolConfig{
+			Address:        pool.Address,
+			Token0Decimals: pool.Token1Decimals,
+			Token1Decimals: pool.Token0Decimals,
+			Token0IsBase:   !pool.Token0IsBase,
+		}, nil
 	}
 
 	return PoolConfig{}, fmt.Errorf("no pool configured for base: %v, quote: %v, chain_id: %v", base, quote, chainID)
