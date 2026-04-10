@@ -55,7 +55,7 @@ type DualPriceFeedConfig struct {
 //   - Cross-check: alerts if OKX and on-chain prices deviate > MaxDeviation
 type DualPriceFeed struct {
 	cfg   DualPriceFeedConfig
-	pools map[TokenPair]poolConfig
+	pools map[TokenPair]PoolConfig
 
 	mu     sync.RWMutex
 	prices map[TokenPair]dualPrice
@@ -108,9 +108,9 @@ func NewDualPriceFeed(cfg DualPriceFeedConfig) (*DualPriceFeed, error) {
 		cfg.StaleThreshold = 30 * time.Second
 	}
 
-	poolMap := make(map[TokenPair]poolConfig)
+	poolMap := make(map[TokenPair]PoolConfig)
 	for _, p := range cfg.Pools {
-		poolMap[p.Pair] = poolConfig{
+		poolMap[p.Pair] = PoolConfig{
 			Address:        p.PoolAddress,
 			Token0Decimals: p.Token0Decimals,
 			Token1Decimals: p.Token1Decimals,
@@ -235,7 +235,7 @@ func (f *DualPriceFeed) runSwapListener(ctx context.Context, client WebSocketCli
 
 // listenSwapEvents sets up a log subscription for Swap events.
 // Returns when the subscription errors or context is cancelled.
-func (f *DualPriceFeed) listenSwapEvents(ctx context.Context, client WebSocketClient, pair TokenPair, pool poolConfig, swapEventID common.Hash) error {
+func (f *DualPriceFeed) listenSwapEvents(ctx context.Context, client WebSocketClient, pair TokenPair, pool PoolConfig, swapEventID common.Hash) error {
 	logCh := make(chan types.Log, 64)
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{pool.Address},
@@ -272,7 +272,7 @@ func (f *DualPriceFeed) listenSwapEvents(ctx context.Context, client WebSocketCl
 
 // priceFromSwapLog extracts the price from a Swap event log.
 // The Swap event emits sqrtPriceX96 as the 3rd non-indexed field.
-func (f *DualPriceFeed) priceFromSwapLog(log types.Log, pool poolConfig) *big.Int {
+func (f *DualPriceFeed) priceFromSwapLog(log types.Log, pool PoolConfig) *big.Int {
 	if len(log.Data) < 160 { // 5 fields × 32 bytes
 		return nil
 	}
@@ -292,7 +292,7 @@ func (f *DualPriceFeed) priceFromSwapLog(log types.Log, pool poolConfig) *big.In
 }
 
 // pollFallback polls slot0() at short intervals when WS is down.
-func (f *DualPriceFeed) pollFallback(ctx context.Context, client WebSocketClient, pair TokenPair, pool poolConfig, duration time.Duration) {
+func (f *DualPriceFeed) pollFallback(ctx context.Context, client WebSocketClient, pair TokenPair, pool PoolConfig, duration time.Duration) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -429,7 +429,7 @@ func (f *DualPriceFeed) publishPrice(pair TokenPair, price *big.Int, source stri
 }
 
 // readSlot0 reads the current price from the pool's slot0().
-func (f *DualPriceFeed) readSlot0(ctx context.Context, client WebSocketClient, pool poolConfig) (*big.Int, error) {
+func (f *DualPriceFeed) readSlot0(ctx context.Context, client WebSocketClient, pool PoolConfig) (*big.Int, error) {
 	calldata, err := poolABI.Pack("slot0")
 	if err != nil {
 		return nil, err

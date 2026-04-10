@@ -24,11 +24,11 @@ type Manager struct {
 	posLocks  positionLockMap      // Per-position mutex to serialize executions.
 
 	// Dynamic pair subscription state (populated by Run, used by OpenPosition).
-	runCtx     context.Context    // Set when Run starts; nil before.
+	runCtx     context.Context // Set when Run starts; nil before.
 	pairSubsMu sync.Mutex
-	pairSubs   map[uint64]map[TokenPair]bool       // chainID → set of subscribed pairs.
-	execChs    map[uint64]chan TriggerEvent          // chainID → execution channel.
-	subWg      map[uint64]*sync.WaitGroup            // chainID → WaitGroup for subscription goroutines.
+	pairSubs   map[uint64]map[TokenPair]bool // chainID → set of subscribed pairs.
+	execChs    map[uint64]chan TriggerEvent  // chainID → execution channel.
+	subWg      map[uint64]*sync.WaitGroup    // chainID → WaitGroup for subscription goroutines.
 }
 
 // positionLockMap provides per-position mutual exclusion so that concurrent

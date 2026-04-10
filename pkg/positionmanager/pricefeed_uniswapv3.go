@@ -33,7 +33,7 @@ func init() {
 // prices from Uniswap V3 pools. Supports both spot (slot0) and TWAP (observe) modes.
 type UniswapV3PriceFeed struct {
 	clients  map[uint64]ChainClient
-	pools    map[TokenPair]poolConfig
+	pools    map[TokenPair]PoolConfig
 	twapSecs uint32 // TWAP window in seconds. 0 = use spot price (slot0).
 
 	mu      sync.RWMutex
@@ -43,7 +43,7 @@ type UniswapV3PriceFeed struct {
 	pollWg  sync.WaitGroup                   // Tracks running poll loops for graceful shutdown.
 }
 
-type poolConfig struct {
+type PoolConfig struct {
 	Address        common.Address
 	Token0Decimals uint8
 	Token1Decimals uint8
@@ -68,9 +68,9 @@ type UniswapV3PoolDef struct {
 // twapSeconds: TWAP window in seconds. Use 0 for spot price (slot0 only).
 // Recommended: 30-120 seconds for anti-manipulation protection.
 func NewUniswapV3PriceFeed(clients map[uint64]ChainClient, pools []UniswapV3PoolDef, twapSeconds uint32) *UniswapV3PriceFeed {
-	poolMap := make(map[TokenPair]poolConfig)
+	poolMap := make(map[TokenPair]PoolConfig)
 	for _, p := range pools {
-		poolMap[p.Pair] = poolConfig{
+		poolMap[p.Pair] = PoolConfig{
 			Address:        p.PoolAddress,
 			Token0Decimals: p.Token0Decimals,
 			Token1Decimals: p.Token1Decimals,
@@ -204,6 +204,14 @@ func (f *UniswapV3PriceFeed) Shutdown(ctx context.Context) error {
 	}
 }
 
+func (f *UniswapV3PriceFeed) LookupPool(ctx context.Context, pair TokenPair) (PoolConfig, error) {
+	pool, ok := f.pools[pair]
+	if !ok {
+		return PoolConfig{}, fmt.Errorf("no pool configured for pair %v", pair)
+	}
+	return pool, nil
+}
+
 // pollLoop polls at regular intervals and publishes price updates.
 func (f *UniswapV3PriceFeed) pollLoop(ctx context.Context, pair TokenPair) {
 	pool := f.pools[pair]
@@ -264,7 +272,7 @@ func (f *UniswapV3PriceFeed) pollLoop(ctx context.Context, pair TokenPair) {
 
 // readSlot0 calls the Uniswap V3 pool's slot0() function and converts
 // sqrtPriceX96 to a human-readable price with 8 decimals.
-func (f *UniswapV3PriceFeed) readSlot0(ctx context.Context, client ChainClient, pool poolConfig) (*big.Int, error) {
+func (f *UniswapV3PriceFeed) readSlot0(ctx context.Context, client ChainClient, pool PoolConfig) (*big.Int, error) {
 	calldata, err := poolABI.Pack("slot0")
 	if err != nil {
 		return nil, err
@@ -289,7 +297,7 @@ func (f *UniswapV3PriceFeed) readSlot0(ctx context.Context, client ChainClient, 
 
 // readTWAP computes a time-weighted average price using pool.observe().
 // This is resistant to flash-loan manipulation unlike raw slot0().
-func (f *UniswapV3PriceFeed) readTWAP(ctx context.Context, client ChainClient, pool poolConfig, windowSecs uint32) (*big.Int, error) {
+func (f *UniswapV3PriceFeed) readTWAP(ctx context.Context, client ChainClient, pool PoolConfig, windowSecs uint32) (*big.Int, error) {
 	// observe([windowSecs, 0]) returns cumulative ticks at [now-window, now].
 	secondsAgos := []uint32{windowSecs, 0}
 	calldata, err := poolABI.Pack("observe", secondsAgos)

@@ -435,3 +435,29 @@ func TestPollLoop_SkipsDuplicatePrice(t *testing.T) {
 		t.Error("dedup check: different price should not be equal")
 	}
 }
+
+func TestLookupPool(t *testing.T) {
+	pair := pricefeedTestPair()
+	poolAddr := common.HexToAddress("0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8")
+	client := newMockChainClient()
+
+	feed := NewUniswapV3PriceFeed(map[uint64]ChainClient{1: client}, []UniswapV3PoolDef{
+		{Pair: pair, PoolAddress: poolAddr, Token0Decimals: 6, Token1Decimals: 18, Token0IsBase: false},
+	}, 0)
+
+	// Test found
+	pool, err := feed.LookupPool(context.Background(), pair)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if pool.Address != poolAddr {
+		t.Errorf("expected pool address %s, got %s", poolAddr, pool.Address)
+	}
+
+	// Test not found
+	unknownPair := TokenPair{Base: common.Address{0x1}, Quote: common.Address{0x2}, ChainID: 1}
+	_, err = feed.LookupPool(context.Background(), unknownPair)
+	if err == nil {
+		t.Fatal("expected error for unknown pair")
+	}
+}
